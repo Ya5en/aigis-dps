@@ -1,0 +1,20 @@
+# aigis-dps 仓库只跟踪代码（白名单式，见 README §git 维护约定）
+#   跟踪: src/  scripts/  VERSION  本文件
+#   不入: 文档(docs/ 与根 *.md)、工具(tools/)、构建产物(build/)、数据(aigis-dps-data)
+
+/*
+!/.gitignore
+!/VERSION
+!/src/
+!/scripts/
+
+# 跟踪目录内的产物/备份兜底（任何深度）
+*.bak
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.log
+*.pdb
+*.ilk

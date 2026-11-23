@@ -1,0 +1,3 @@
+LIBRARY mfplay
+; v10.27: 导出转发已改为源码内 #pragma comment(linker, "/EXPORT:...") 转发字符串
+;（NT 绝对路径直达 SysWOW64 真身），本文件仅保留内部模块名声明。
