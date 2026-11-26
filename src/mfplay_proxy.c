@@ -96,10 +96,18 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.35（2026-11-26，1.3.1）：**受击方来源还原为 ctor 的 arg_8**。
+ *   v10.33/v10.34 曾把受击方改成结算 hook 的 ecx（this）。实测口径不对：
+ *   vi（种类键）与 vg（实例 gen）都依赖「被 identify 的那个对象就是 ctor
+ *   收到的受击单位」——ecx 是结算侧的显示/单位上下文，与 ctor 的 arg_8
+ *   不保证同一实例，一旦不同 → vt≠1 整条丢弃，或 vi/vg 取到错对象。
+ *   还原：主 hook 直传 (atk_obj, vic_obj, d) 三个 DWORD，结算 hook 取用后
+ *   清零；vi/vg 的判定逻辑与路径**完全回到 v10.2–v10.31 原样**，一行未改。
+ *
  * v10.34（2026-11-26，1.3.0）：**删除配对与缓存**——战斗模拟全程单线程。
  *   删：TLS 槽（TlsAlloc/TlsGetValue/HeapAlloc）、pend_t 状态、used 标志、
  *       指针判据、pair_miss/no_slot/pend 计数、首次配对日志、GF 缓存。
- *   留：主 hook 只写 g_atk/g_d 两个 DWORD；结算 hook 取用后立即清零。
+ *   留：主 hook 只写 g_atk/g_vic/g_d 三个 DWORD；结算 hook 取用后清零。
  *   配对消失后「怎么保证一一对应」的答案是**顺序本身**：单线程里 ctor 一定在
  *   它自己的结算之前、且之间不会有别的 ctor 抢先（同节点内串行），所以
  *   「最近一次赋值」就是「本次结算的那一个」，不需要任何判据。
@@ -810,9 +818,11 @@ static void shm_publish(const char *payload, DWORD len)
 
 /* ------------------------------------------------------------------ */
 /* 单线程直传（v10.34）：整个战斗模拟是单线程的，因此**不再有配对**。    */
-/*   主 hook 只做一次赋值：攻击者对象 + 入口伤害值；                    */
-/*   结算 hook 直接取用（取完清零），受击者就是自己的 ecx（this）。      */
+/*   主 hook 只做一次赋值：攻击者 + 受击者 + 伤害值 + GameFrame；       */
+/*   结算 hook 直接取用（取完清零）。                                    */
 /*   没有 TLS、没有槽位状态、没有匹配判据、没有补发、没有跨事件计数。    */
+/*   v10.35：受击者仍是 ctor 的 arg_8（不是结算侧 ecx）—— vi/vg 的       */
+/*   判定对象必须是 ctor 收到的那个受击单位；gf 也回到 ctor 时刻读取。   */
 /* ------------------------------------------------------------------ */
 /* ⚠ 为什么仍要保留主 hook：身份解析必须推迟到 ctor 之后。
  *
@@ -821,9 +831,12 @@ static void shm_publish(const char *payload, DWORD len)
  * 而整个 4F4xxx 区间内 call 0xaaefc0 只出现在 ctor 内部的两处（攻击者/受击者）
  * —— 句柄是在 ctor 里才被创建的。所以「攻击者对象指针」只能在 ctor 入口取到、
  * 在结算点才可解析；而结算侧只有 CDamageHandle（键值）与受击单位 this，
- * 反查不到攻击者对象。故主 hook 保留，但只存两个 DWORD，不做任何判断。 */
+ * 反查不到攻击者对象，也反查不到「ctor 认定的受击单位」。
+ * 故主 hook 保留，只存三个 DWORD，不做任何判断。 */
 static DWORD g_atk = 0;      /* 最近一次 ctor 的攻击者对象指针（用后清零）*/
+static DWORD g_vic = 0;      /* 最近一次 ctor 的受击者对象指针（同上）   */
 static DWORD g_d   = 0;      /* 同一节点的入口伤害值（d 的回退口径）     */
+static DWORD g_gf  = 0;      /* 同一节点的 GameFrame（时间轴，同口径）   */
 
 /* 诊断计数器（写入方独占，reader 只读；失败静默） */
 static void diag_inc(DWORD off)
@@ -888,8 +901,8 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
 /*   调用时机在 ctor 返回之后，ctor 内的两次 GetHandle 已把句柄建好。    */
 /* ------------------------------------------------------------------ */
 
-static void resolve_publish(DWORD atk_obj, DWORD vic_obj, DWORD d_ctor,
-                            DWORD has_ty, DWORD ty, DWORD d_ov)
+static void resolve_publish(DWORD gf, DWORD atk_obj, DWORD vic_obj,
+                            DWORD d_ctor, DWORD has_ty, DWORD ty, DWORD d_ov)
 {
     DWORD atk_h = 0, vic_h = 0;
     DWORD at, vt, ai = 0, ag = 0, vg = 0;
@@ -948,15 +961,12 @@ static void resolve_publish(DWORD atk_obj, DWORD vic_obj, DWORD d_ctor,
      * 16 字节对齐，右移 4 即槽号（与实机点阵逐一对照验证无误）。
      * 例：0x212990 → 4761。越界/不可读时置 0（前端单列一桶）。 */
     {
-        DWORD param = 0, pval = 0, vi = 0, gf = 0;
+        DWORD param = 0, pval = 0, vi = 0;
         if (vobj && safe_read32((const BYTE *)vobj + 4, &param) && param >= 0x10000) {
             safe_read32((const BYTE *)(UINT_PTR)param + 0x5C, &pval);
             if (pval >= 0x200000u && pval < 0x400000u)
                 vi = (pval - 0x200000u) >> 4;
         }
-        /* 时间轴在结算时刻读（比 ctor 时刻更贴近实际扣血帧） */
-        safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
-        if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
         /* d_ov = 属性表伤害总量（DCC328），非 0 优先于 ctor 侧读数 */
         publish_event(gf, d_ov ? d_ov : d_ctor, ai, ag, vg, vi, has_ty, ty);
     }
@@ -969,15 +979,15 @@ drop:
 }
 
 /* ------------------------------------------------------------------ */
-/* report_ctor：主 hook 入口，只做两个 DWORD 的赋值，不做任何判断。      */
+/* report_ctor：主 hook 入口，只做赋值，不做任何判断。                    */
 /*   atk/vic 为对象指针（game 自身在任一为 0 时直接返回，同步过滤），     */
 /*   dptr 为伤害值指针（入口即终值）。                                    */
-/*   v10.34：没有 TLS、没有槽位标志、不写 GF —— 单线程直传。              */
+/*   v10.34 去掉了 TLS / 槽位标志；v10.35 起直传 (gf, atk, vic, d) 四项。*/
 /* ------------------------------------------------------------------ */
 
 static void report_ctor(DWORD atk_obj, DWORD vic_obj, const DWORD *dptr)
 {
-    DWORD dmg;
+    DWORD dmg, gf;
 
     if (!g_shm) return;                  /* SHM 创建失败 → 通道静默禁用    */
     diag_inc(META_DIAG_CTOR);            /* 诊断：主 hook 命中             */
@@ -987,8 +997,16 @@ static void report_ctor(DWORD atk_obj, DWORD vic_obj, const DWORD *dptr)
         diag_or(META_DIAG_WHY, 1);
         return;
     }
+    /* 时间轴：GameFrame（暂停/倍速免疫）—— 与 v10.2–v10.34 同口径，
+     * 在 ctor 入口读一次随事件带走，不在结算时刻另行读取。 */
+    gf = 0;
+    safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
+    if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
+
     g_atk = atk_obj;
+    g_vic = vic_obj;
     g_d   = dmg;
+    g_gf  = gf;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1043,21 +1061,22 @@ static BOOL create_hook(void)
 
 /* ------------------------------------------------------------------ */
 /* report_settle：结算 hook 入口，直接发布，不做任何配对判断。            */
-/*   ecx(this) = 受击单位对象（sub_5CBBE0+0x4D5 里 ecx=ebx，[ebx+0Ch]    */
-/*              就是刚被扣减的 HP）→ 直接当受击方，不再比对、不需缓存。  */
-/*   [esp+4]   = CDamageHandle* → ty（sub_4F1E50）+ d（DCC328）。        */
-/*   v10.34：攻击者取主 hook 直传的 g_atk，取完清零 —— 单线程顺序即正确性 */
-/*   的全部保证，没有槽位、没有状态机。                                   */
+/*   [esp+4] = CDamageHandle* → ty（sub_4F1E50）+ d（DCC328）。          */
+/*   攻击者/受击者取主 hook 直传的 g_atk / g_vic，取完清零 —— 单线程顺序 */
+/*   即正确性的全部保证，没有槽位、没有状态机。                          */
+/*   v10.35：受击方**不取** ecx；vi/vg 必须基于 ctor 的 arg_8 解析。     */
 /* ------------------------------------------------------------------ */
 
-static void report_settle(const void *handle, DWORD vic_obj)
+static void report_settle(const void *handle)
 {
-    DWORD atk_obj, d_ctor;
+    DWORD atk_obj, vic_obj, d_ctor, gf;
     DWORD ty = 0, d2 = 0, has_ty = 0;
 
     diag_inc(META_DIAG_TYHIT);           /* 诊断：结算 hook 命中           */
     atk_obj = g_atk; g_atk = 0;          /* 取用并清零（不残留给下一次）   */
+    vic_obj = g_vic; g_vic = 0;
     d_ctor  = g_d;   g_d   = 0;
+    gf      = g_gf;  g_gf  = 0;
     if (!atk_obj || !vic_obj) {          /* 无前置 ctor：本次不发布       */
         diag_inc(META_DIAG_NOPD);
         return;
@@ -1079,7 +1098,7 @@ static void report_settle(const void *handle, DWORD vic_obj)
                                           + RVA_KEY_D2));
 
     if (has_ty) diag_inc(META_DIAG_TYPAIR);
-    resolve_publish(atk_obj, vic_obj, d_ctor, has_ty, ty, d2);
+    resolve_publish(gf, atk_obj, vic_obj, d_ctor, has_ty, ty, d2);
 }
 
 __declspec(naked) static void hook_settle(void)
@@ -1087,11 +1106,9 @@ __declspec(naked) static void hook_settle(void)
     __asm {
         pushad
         mov     eax, [esp+36]           /* arg_0 = CDamageHandle*（32B+4）*/
-        mov     edx, ecx                /* ecx = this = 受击单位对象     */
-        push    edx                     /* 第 2 参：受击方               */
-        push    eax                     /* 第 1 参：取 ty/d 的 handle    */
+        push    eax                     /* 唯一入参：取 ty/d 的 handle   */
         call    report_settle
-        add     esp, 8
+        add     esp, 4
         popad
         jmp     [g_tram_t]              /* 原 5 字节序言 + 回跳          */
     }
@@ -1196,7 +1213,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.34 shm=%d main_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.35 shm=%d main_hook=%d(RVA 0x%X) "
             "settle_hook=%d(RVA 0x%X) ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hooked, HOOK_RVA,
             g_hook_settle, HOOK_SETTLE_RVA,
