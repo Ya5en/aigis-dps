@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 正式发布版 1.4.0（PRD v1.7，实现版本 v10.36）
+ * aigis-dps / mfplay_proxy.c —— 版本 1.4.0（PRD v1.7，实现版本 v10.37）
  *
  * 业务：dps 统计。两个 hook，职责分层：
  *   hook1  sub_4F3FA0（CDamageHandle ctor / 三条创建路径的唯一漏斗）
@@ -43,7 +43,8 @@
  *          （PatternID 函数 RVA 落 .text 模式处理区、16B 对齐；与实机点阵
  *          逐一对照验证无误；越界/不可读 = 0）
  *     d  = 伤害值 = 属性表伤害总量（sub_4F13B0(handle,&dword_DCC328)，
- *          即 HP 结算实际扣血）。唯一来源；读到 0 = 本次未扣血，整条丢弃。
+ *          即 HP 结算实际扣血）。唯一来源；0 = 本次未扣血，事件照发，
+ *          由消费端按 d>0 过滤（v10.37）。
  *     ty = 伤害结算标志集 = 结算 hook（sub_5CAC50）入参 arg_0（CDamageHandle*）
  *          → sub_4F1E50 13 键 OR 重组取得完整 dword（纯读无副作用）。
  *          位域 bit0~21：bit0=Magic、bit6=Critical、bit7=紫档基线等，
@@ -98,6 +99,17 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.37（2026-11-26）：**hook2 不丢弃任何一次命中**——每次结算恰好发布一条。
+ *   删除 report_settle 的两处早退：
+ *     ① 无 hook1 身份（原 no_prev → return）：改为 ai/ag/vg/vi 四字段写 0
+ *        后照发，no_prev 降级为质量计数；
+ *     ② d==0（原 why|1 + drop → return）：改为 d 写 0 后照发，新增计数
+ *        zero_d（0x38）。
+ *   由此「ty_hits == published」严格成立（唯一例外是 payload 组装失败，不可达）。
+ *   drop_count(0x1C) 语义收窄为「仅 hook1 语义过滤」，why_bits 降级为观测位。
+ *   消费端口径随之变化：统计前必须自行过滤 d==0 与 ai==0 的条目。
+ *   诊断块版本 2 → 3（0x38 重新启用为 zero_d，0x20 不再是丢弃）。
  *
  * v10.36（2026-11-26，1.4.0）：**架构定稿**——hook1 解析身份，hook2 补时间与数值。
  *   hook1（sub_4F3FA0，ctor 入口）完成全部身份解析并直传 ai/ag/vg/vi 四项，
@@ -220,7 +232,7 @@ static const BYTE EXPECT_PROLOGUE[HOOK_PATCH_LEN] =
  *     ty ← sub_4F1E50(handle)：13 键 OR 重组的完整 dword（纯读，无副作用）；
  *           序言不符 → ty_src=0，该字段整场省略。
  *     d  ← sub_4F13B0(handle, &dword_DCC328)：HP 结算实际扣血；
- *           读到 0 = 本次未扣血，整条丢弃。
+ *           0 = 本次未扣血，事件照发（d=0），消费端过滤（v10.37）。
  * prologue: push ebp / mov ebp,esp / and esp,-8 = 55 8B EC 83 E4 F8，
  * 取前 5 字节作漂移签名（MinHook 自行按完整指令重定位，不要求对齐）。 */
 #define HOOK_SETTLE_RVA       0x1CAC50
@@ -671,20 +683,23 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_OLDEST     0x48u
 
 /* 诊断区（reader 可忽略；写入方只有 DLL）。只留「链路断在哪一级」的计数：
- * hook1 未命中 / 被语义过滤 / hook2 未命中 / 无 hook1 身份 / 发布成功。 */
-#define META_DIAG_VER   0x10u   /* 诊断块版本 = 2                         */
+ * hook1 未命中 / 被语义过滤 / hook2 未命中 / 无 hook1 身份 / 发布成功。
+ * v10.37 起 hook2 不再丢弃任何一次命中：no_prev / zero_d 只是质量计数，
+ * 不代表少一条事件。 */
+#define META_DIAG_VER   0x10u   /* 诊断块版本 = 3                         */
 #define META_DIAG_FLAGS 0x14u   /* bit0 hook1 bit1 hook2 bit2 shm         */
 #define META_DIAG_CTOR  0x18u   /* hook1 命中次数                         */
-#define META_DIAG_DROP  0x1Cu   /* 丢弃次数（语义过滤或 d==0）            */
-#define META_DIAG_NOPREV 0x20u  /* hook2 命中但没有 hook1 身份            */
-#define META_DIAG_TYHIT 0x24u   /* hook2 命中次数                         */
+#define META_DIAG_DROP  0x1Cu   /* hook1 语义过滤丢弃次数（不含 hook2）   */
+#define META_DIAG_NOPREV 0x20u  /* hook2 命中但无 hook1 身份（仍发布）    */
+#define META_DIAG_TYHIT 0x24u   /* hook2 命中次数 = 发布条数              */
 #define META_DIAG_TYPAIR 0x28u  /* 带 ty 的发布次数                       */
-#define META_DIAG_PUB   0x2Cu   /* 实际发布条数                           */
+#define META_DIAG_PUB   0x2Cu   /* 实际发布条数（应恒 == ty_hits）        */
 #define META_DIAG_GF    0x30u   /* 最近一次发布的 gf                      */
-#define META_DIAG_WHY   0x34u   /* 丢弃原因位：1 d==0 / 2 参数为空 /
+#define META_DIAG_WHY   0x34u   /* 观测位（不代表丢弃）：1 d==0 / 2 参数为空 /
                                  * 4 受击者非敌方 / 8 攻击者非玩家系 /
                                  * 16 missile owner 解析失败 /
                                  * 32 owner 非玩家系                       */
+#define META_DIAG_ZEROD 0x38u   /* hook2 的 d==0 次数（仍发布，d 记 0）   */
 static HANDLE         g_shm_map  = NULL;
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
 static volatile DWORD *g_meta     = NULL;
@@ -717,7 +732,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 2;
+    g_meta[META_DIAG_VER / 4]  = 3;
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_CTOR / 4] = 0;
     g_meta[META_DIAG_DROP / 4] = 0;
@@ -727,6 +742,7 @@ static void shm_init(void)
     g_meta[META_DIAG_PUB / 4]  = 0;
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
+    g_meta[META_DIAG_ZEROD / 4]= 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -846,8 +862,8 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
 /* report_ctor（hook1）：ctor 入口，解析身份 + DPS 语义过滤 + 直传。      */
 /*   arg_4 攻击者对象 / arg_8 受击者对象（game 自身在任一为 0 时早退）。  */
 /*   这里不发布、不碰时间轴、不碰伤害值 —— gf/d/ty 全部归 hook2。        */
-/*   过滤失败时不发布，并把 g_id_ok 置 FALSE：结算侧拿不到身份就整条跳过， */
-/*   不会复用上一条事件。                                                */
+/*   过滤失败时不发布，并把 g_id_ok 置 FALSE：结算侧据此把四个身份字段    */
+/*   写 0（v10.37 起仍发布该条，不再跳过），也不会复用上一条事件。        */
 /* ------------------------------------------------------------------ */
 
 static void report_ctor(DWORD atk_obj, DWORD vic_obj)
@@ -967,10 +983,10 @@ static BOOL create_hook(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* report_settle（hook2）：唯一发布点。                                   */
+/* report_settle（hook2）：唯一发布点，**每次命中都发布一条**（v10.37）。 */
 /*   [esp+4] = CDamageHandle* → ty（sub_4F1E50 13 键重组）+ d（DCC328）。 */
 /*   取 hook1 直传的 ai/ag/vg/vi（取用即清零）→ 填 gf（结算帧 GameFrame） */
-/*   → 发布。d 只认 DCC328：读到 0 说明本次未扣血，整条丢弃。             */
+/*   → 发布。身份缺失 / d==0 都不丢弃：四字段或 d 写 0，交消费端过滤。     */
 /* ------------------------------------------------------------------ */
 
 static void report_settle(const void *handle)
@@ -978,13 +994,13 @@ static void report_settle(const void *handle)
     ident_t id;
     DWORD ty = 0, d = 0, gf = 0, has_ty = 0;
 
-    diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中               */
+    diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中（= 发布条数） */
 
     id = g_id;                           /* 取用即清零，不残留给下一次     */
     g_id.ai = g_id.ag = g_id.vg = g_id.vi = 0;
-    if (!g_id_ok) {                      /* 无 hook1 身份：本次不发布     */
-        diag_inc(META_DIAG_NOPREV);
-        return;
+    if (!g_id_ok) {                      /* 无 hook1 身份：照常发布        */
+        id.ai = id.ag = id.vg = id.vi = 0;   /* 四字段 = 0（未知）         */
+        diag_inc(META_DIAG_NOPREV);      /* 质量计数，不是丢弃             */
     }
     g_id_ok = FALSE;
 
@@ -994,15 +1010,15 @@ static void report_settle(const void *handle)
         has_ty = 1;
     }
 
-    /* d：属性表里的伤害总量（DCC328 = HP 实际扣血）；0 = 本次未扣血 */
+    /* d：属性表里的伤害总量（DCC328 = HP 实际扣血）。
+     * v10.37 起取不到 / 为 0 也照常发布（d 记 0），不再整条丢弃。        */
     if (handle && g_fn_get_prop)
         d = g_fn_get_prop((void *)handle, NULL,
                           (const void *)((const BYTE *)(UINT_PTR)g_base
                                          + RVA_KEY_D2));
     if (!d) {
         diag_or(META_DIAG_WHY, 1);
-        diag_inc(META_DIAG_DROP);
-        return;
+        diag_inc(META_DIAG_ZEROD);       /* 质量计数，不是丢弃             */
     }
 
     /* gf：结算这一帧的 GameFrame（时间轴随发布时刻） */
@@ -1125,7 +1141,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.36 shm=%d main_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.37 shm=%d main_hook=%d(RVA 0x%X) "
             "settle_hook=%d(RVA 0x%X) ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hooked, HOOK_RVA,
             g_hook_settle, HOOK_SETTLE_RVA,
