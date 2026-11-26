@@ -101,6 +101,14 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.39（2026-11-27）：修复 v10.38 的 ai/ag 全 0——管理器全局现读。
+ *   根因：dword_4F82980 是惰性创建的全局（4F0xxx 属性家族内多处
+ *   `mov dword_4F82980, edi/ebx` 运行时写入，首次使用伤害属性系统时才有值），
+ *   v10.38 却在 DLL init 时 safe_read32 一次缓存进 g_mgr —— 战斗未开始，
+ *   恒为 0，导致 report_settle 的攻击者分支整体短路（why|=16，ai/ag 全 0）。
+ *   修正：g_mgr 改为 report_settle 内每次现读（一次 safe_read32）；
+ *   init 不再读；DbgView node_src 语义收窄为「node 原语序言校验通过」。
+ *
  * v10.38（2026-11-26）：**单 hook 定稿**——hook1（sub_4F3FA0 ctor）整体移除，
  *   身份解析迁入 hook2（sub_5CAC50）内用 CDamageHandle* 完成，数据源与
  *   引擎自身解析链同源（SUB_5CBBE0_DECOMPILE §7/§10）：
@@ -252,7 +260,11 @@ static const BYTE PROLOGUE_TY_REASM[3] = { 0x56, 0x57, 0x68 };
 
 /* node 查表原语（v10.38）：sub_4F4B50(mgr, handle) → CDamageProperty 节点。
  * __thiscall(ecx = dword_4F82980 管理器, 栈参 handle)；攻击者句柄 = [node+0Ch]
- * （sub_5CBBE0 自己的解析链：v11=4F4B50(a2); v12=*(v11+12)）。 */
+ * （sub_5CBBE0 自己的解析链：v11=4F4B50(a2); v12=*(v11+12)）。
+ * ⚠ dword_4F82980 是**惰性创建**的全局（4F0xxx 属性家族内多处
+ * `mov dword_4F82980, edi/ebx` 运行时写入，首次使用伤害属性系统时才有值）：
+ * init 时必为 0 —— v10.38 曾在 init 读一次缓存，导致整场 ai/ag=0（v10.39
+ * 修正为每次结算现读）。 */
 #define RVA_NODE_LOOKUP 0xF4B50  /* sub_4F4B50 → node*（0 = 查无）         */
 #define RVA_MGR         0xB82980 /* dword_4F82980：伤害属性管理器指针      */
 static const BYTE PROLOGUE_NODE_LOOKUP[5] = { 0x55, 0x8B, 0xEC, 0x56, 0x57 };
@@ -275,7 +287,8 @@ typedef DWORD (__fastcall *fn_node_lookup)(void *mgr, void *unused_edx,
 static fn_get_prop    g_fn_get_prop = NULL;
 static fn_ty_reasm    g_fn_ty_reasm = NULL;
 static fn_node_lookup g_fn_lookup   = NULL;
-static DWORD          g_mgr         = 0;     /* dword_4F82980 的当前值       */
+static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
+                                                * v10.38 曾 init 读一次 → 恒 0）*/
 static BOOL        g_hook_settle = FALSE;   /* hook2（唯一 hook/发布点）    */
 
 /* ------------------------------------------------------------------ */
@@ -900,9 +913,13 @@ static void report_settle(const void *handle, DWORD vic_obj)
     }
 
     /* ---------- 身份：攻击者（handle → node → [node+0Ch] 句柄） ---------- */
+    /* 管理器指针每次现读：dword_4F82980 惰性创建（4F0xxx 家族运行时写入），
+     * init 时必为 0 —— v10.39 修正，否则整场 ai/ag=0。 */
     if (!handle) {
         why |= 2;                        /* arg_0 为空：ty/d 也取不到     */
-    } else if (g_fn_lookup && g_mgr) {
+    } else if (g_fn_lookup &&
+               safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_MGR, &g_mgr) &&
+               g_mgr) {
         DWORD node = g_fn_lookup((void *)(UINT_PTR)g_mgr, NULL,
                                  (DWORD)(UINT_PTR)handle);
         DWORD atk_h = 0;
@@ -1067,7 +1084,8 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
             g_fn_ty_reasm = (fn_ty_reasm)tp;
         if (memcmp(np, PROLOGUE_NODE_LOOKUP, sizeof PROLOGUE_NODE_LOOKUP) == 0)
             g_fn_lookup = (fn_node_lookup)np;
-        safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_MGR, &g_mgr);
+        /* g_mgr 不在 init 读：dword_4F82980 惰性创建，此时必为 0。
+         * 每次结算时在 report_settle 内现读（v10.39）。 */
     }
 
     /* 诊断：安装状态写入 SHM flags + DbgView 单行摘要（排查"无数据"用） */
@@ -1079,10 +1097,10 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.38 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.39 shm=%d settle_hook=%d(RVA 0x%X) "
             "node_src=%d ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
-            (g_fn_lookup && g_mgr) ? 1 : 0,
+            g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
             g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0, (unsigned)g_base);
         OutputDebugStringA(msg);
     }
