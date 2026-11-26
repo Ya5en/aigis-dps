@@ -39,15 +39,16 @@
  *     vi = 受击者种类键 = 模式槽索引 = (*( *(vic+4) + 5Ch ) − 0x200000) >> 4
  *          （PatternID 函数 RVA 落 .text 模式处理区、16B 对齐；与实机点阵
  *          逐一对照验证无误；越界/不可读 = 0）
- *     d  = 伤害值。v10.31 起优先取副 hook 处的属性表伤害总量
+ *     d  = 伤害值。取结算 hook 处的属性表伤害总量
  *          （sub_4F13B0(prop,&dword_DCC328) = HP 结算实际扣血）；读到 0
- *          （未设置）时退回主 hook 的 *arg_C 入口终值。
- *     ty = 伤害结算标志集 = 副 hook（sub_5CAC50，v10.31 换点）入参
- *          arg_0 = CDamageProperty*，经 sub_4F1E50 13 键 OR 重组取得完整
- *          dword（纯读；序言漂移时退化为 prop+0x1C 直读，即原 4F18A0
- *          同源缓存）。位域 bit0~21：bit0=Magic、bit6=Critical、bit7=紫档
- *          基线等，详见 FINDINGS §44。与主 hook 事件按「最近一次未配对」
- *          同线程配对；配对/读取失败 → 整个字段省略（JSON 缺省不输出）。
+ *          （未设置）时退回主 hook 登记的 *arg_C 入口值。
+ *          v10.32 起 d 只有这一条产出路径，不再与 ctor 口径混用。
+ *     ty = 伤害结算标志集 = 结算 hook（sub_5CAC50）入参 arg_0（CDamageHandle*）
+ *          → sub_4F1E50 13 键 OR 重组取得完整 dword（纯读无副作用）。
+ *          位域 bit0~21：bit0=Magic、bit6=Critical、bit7=紫档基线等，
+ *          详见 FINDINGS §44。
+ *          v10.32：发布只发生在结算 hook，且必须消费到本次 pending，因此
+ *          「事件缺 ty」只剩 ty_src=0（sub_4F1E50 序言漂移）一种成因。
  *          **可选字段恒在末位**：带/不带 ty 的事件共享稳定前缀。
  *
  * v10.2（2026-11-20 实跑修正）：身份解析从 ctor 入口推迟到副 hook（ctor 之后）。
@@ -96,15 +97,27 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.32（2026-11-26，1.2.0）：**发布权收敛到结算 hook 一处**。
+ *   动因：v10.29–v10.31 有 4 条产出路径（结算 hook 正常 / pending 挤占补发 /
+ *   槽不可用就地发布 / 结算 hook 未装），只有 1 条带 ty，其余 3 条缺 ty 且 d
+ *   退回 ctor 入口口径 —— 同一份 DPS 里混着两种伤害语义，对账闭合不了。
+ *   改法：主 hook（sub_4F3FA0）降级为**纯身份登记**，不做任何发布；publish
+ *   只在 report_settle 里发生，且必须消费到本次 pending。代价是失配即丢事件
+ *   （DISP / NOSLOT 计数），收益是所有事件 ty/d 同源、口径唯一。
+ *   附带修正：v10.31 的「ty 退化直读 prop+0x1C」是错的 —— sub_5CAC50 的
+ *   arg_0 是 CDamageHandle（12 字节三元组 +0x0C 侧别/+0x04 idA/+0x08 idB），
+ *   不是 CDamageProperty，+0x1C 既越界也不含 ty。已删除该分支。
+ *
  * v10.31（2026-11-26，1.1.0）：副 hook 换点 sub_4F18A0 → sub_5CAC50。
- *   新点入参是 CDamageProperty*（不再是 ty 指针），因此一次可取两样：
+ *   新点入参一次可取两样：
  *   ① ty = sub_4F1E50(prop)，游戏自身的 13 键 OR 重组器（纯读无副作用），
- *      比 direct dword 读更完整；序言校验失败时退化 prop+0x1C 直读。
+ *      比 direct dword 读更完整。
  *   ② d  = sub_4F13B0(prop, &dword_DCC328)，HP 结算实际扣血总量；读到 0
  *      时退回 ctor 侧 *arg_C。协议布局不变，d 语义改为「结算总扣血」。
  *   覆盖说明：sub_5CAC50 被敌方侧结算主函数 sub_5CBBE0 无条件调用（函数
  *   内部护盾为 0 只影响表现，不影响 hook 命中），但它是「结算点」而非
  *   「ctor 紧邻点」，多条伤害节点并入同一次结算时 pending 会被后写覆盖。
+ *   （该覆盖问题在 v10.32 由「丢弃 + 计数」处理，不再补发半成品事件。）
  *
  * 1.0.0（2026-11-22）：首个正式发布版。项目层版本号（semver）与内部实现
  *   版本号（v10.x 沿革）从此并行：1.0.0 对应实现 v10.29；DbgView init 行
@@ -667,7 +680,8 @@ static DWORD inst_id(DWORD handle, DWORD obj)
                                  * 4 受击者非敌方 8 攻击者非玩家
                                  * 16 missile owner 解析失败
                                  * 32 owner 非玩家 */
-#define META_DIAG_DISP  0x38u   /* pending 被挤占（缺 ty 补发）次数 */
+#define META_DIAG_DISP  0x38u   /* 槽被挤占 → 旧事件弃置（不发布）   */
+#define META_DIAG_NOSLOT 0x3Cu  /* 主 hook 命中但无槽位 → 事件弃置   */
 /* v10.2 追加：身份判定分布的直方图（定位「误过滤」用的核心证据） */
 #define META_DIAG_HISTA 0x50u   /* atk 类型直方图 [0..7]（16B…共 32B） */
 #define META_DIAG_HISTV 0x70u   /* vic 类型直方图 [0..7]               */
@@ -774,14 +788,14 @@ static void shm_publish(const char *payload, DWORD len)
 }
 
 /* ------------------------------------------------------------------ */
-/* ty 配对（v10.31）：副 hook 现为 sub_5CAC50（结算点），不再紧邻 ctor；  */
-/* （同线程），按「最近一次未配对的 4F3FA0 事件」配对写入 ty。           */
+/* 配对槽（v10.32 语义）：主 hook 只登记，结算 hook 独占发布权。         */
 /*   主 hook 过滤通过 → 挂 per-thread pending 槽（TLS），不发布；       */
-/*   副 hook 入口读 dword [arg_0]（ty 位标志集）后消费 pending：         */
-/*   读失败 → 省略 ty 发布；无 pending（无前置创建）→ 跳过。            */
-/*   pending 被下一个创建挤占（上一次结算点未到达）→ 旧事件按缺省       */
-/*   ty 发布（顺序保持，安全降级不丢失）。副 hook 降级 → 主 hook 直接  */
-/*   发布省略 ty 版本。JSON 缺省字段不输出，不阻塞、不补默认值。        */
+/*   结算 hook 入口 → 消费 pending，用同一 prop 取 ty/d 后发布。         */
+/*   槽已被占（上一事件未等到结算点）→ 旧事件**丢弃**并计 DISP；         */
+/*   无槽位（结算 hook 未装 / TLS 失败）→ 事件**丢弃**并计 NOSLOT；      */
+/*   结算 hook 命中但无 pending → 跳过并计 NOPD。                        */
+/*   三条丢弃路径的共同点：绝不产出「缺 ty / d 口径不同」的半成品事件。  */
+/* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /* ⚠ 2026-11-20 实跑修正：身份解析必须推迟到 ctor 之后。
  *
@@ -876,8 +890,8 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
 
 /* ------------------------------------------------------------------ */
 /* resolve_publish：pending 事件的身份解析 + DPS 语义过滤 + 发布          */
-/*   调用时机必须在 ctor 返回之后（副 hook / 挤占补发），此时 ctor 内部  */
-/*   的两次 GetHandle 已把句柄缓存建好（见 pend_t 上方说明）。           */
+/*   v10.32 起**唯一调用点** = report_settle，调用时机在 ctor 返回之后， */
+/*   此时 ctor 内部的两次 GetHandle 已把句柄缓存建好（见 pend_t 上方说明）。*/
 /* ------------------------------------------------------------------ */
 
 static void resolve_publish(pend_t *p, DWORD has_ty, DWORD ty, DWORD d_ov)
@@ -984,29 +998,24 @@ static void report_ctor(DWORD atk_obj, DWORD vic_obj, const DWORD *dptr)
     safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
     if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
 
-    /* 暂存 → 等副 hook 配对后解析（解析时机必须在 ctor 返回之后） */
+    /* v10.32：主 hook **只登记、不发布**。发布权唯一属于结算 hook ——
+     * 这样每条对外事件都必然来自同一次 CDamageProperty 读取，ty 与 d 同源。
+     *   · 无槽位（结算 hook 未装 / TLS 分配失败）→ 本事件无处落地，丢弃；
+     *   · 槽位被占（上一事件还没等到结算点）→ 旧事件丢弃，槽被新事件覆盖。
+     *     丢弃是刻意的：宁可缺一条，也不产出与 ty 无关的半成品事件。 */
     p = g_hook_settle ? pend_get() : NULL;
-    if (p) {
-        if (p->used) {                   /* 上一事件未等到结算点：补发    */
-            p->used = 0;
-            resolve_publish(p, 0, 0, 0);
-            diag_inc(META_DIAG_DISP);
-        }
-        p->gf = gf; p->d = dmg;
-        p->atk_obj = atk_obj; p->vic_obj = vic_obj;
-        p->used = 1;
-        diag_inc(META_DIAG_PEND);
+    if (!p) {
+        diag_inc(META_DIAG_NOSLOT);
         return;
     }
-
-    /* 副 hook 不可用（安装失败 / TLS 分配失败）→ 就地解析，省略 ty。
-     * 此时句柄可能尚未建好，identify 会退化到直接 RTTI 路径。 */
-    {
-        pend_t tmp;
-        tmp.gf = gf; tmp.d = dmg;
-        tmp.atk_obj = atk_obj; tmp.vic_obj = vic_obj; tmp.used = 0;
-        resolve_publish(&tmp, 0, 0, 0);
+    if (p->used) {                       /* 上一事件未等到结算点：丢弃   */
+        p->used = 0;
+        diag_inc(META_DIAG_DISP);
     }
+    p->gf = gf; p->d = dmg;
+    p->atk_obj = atk_obj; p->vic_obj = vic_obj;
+    p->used = 1;
+    diag_inc(META_DIAG_PEND);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1078,11 +1087,12 @@ static void report_settle(const void *prop)
     }
     p->used = 0;                         /* 先消费（失败也走缺省发布）    */
 
-    /* ① ty：优先调游戏自身的 13 键重组器（纯读），退化时直读 +0x1C 缓存 */
+    /* ① ty：唯一来源 = 游戏自身的 13 键重组器（纯读，无副作用）。
+     * ⚠ v10.31 曾在此退化读 prop+0x1C —— 那是错的：sub_5CAC50 的 arg_0 是
+     *   CDamageHandle（12 字节三元组：+0x0C 侧别标签 / +0x04 idA / +0x08 idB），
+     *   不是 CDamageProperty；+0x1C 既越界也不含 ty。已删除，ty 读不到即省略。 */
     if (prop && g_fn_ty_reasm) {
         ty = g_fn_ty_reasm((void *)prop, NULL);
-        has_ty = 1;
-    } else if (prop && safe_read32((const BYTE *)prop + 0x1C, &ty)) {
         has_ty = 1;
     }
 
@@ -1210,7 +1220,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.31 shm=%d main_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.32 shm=%d main_hook=%d(RVA 0x%X) "
             "settle_hook=%d(RVA 0x%X) ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hooked, HOOK_RVA,
             g_hook_settle, HOOK_SETTLE_RVA,
