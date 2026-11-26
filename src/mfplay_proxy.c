@@ -97,13 +97,25 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.33（2026-11-26，1.2.1）：配对判据改为**受击单位对象指针相等**。
+ *   旧（v10.32）：结算 hook 命中即无条件消费 pending —— 只要这次结算到来，
+ *   不管它是不是 pending 记的那一次伤害，都拿 pending 的 atk/vic 发布。
+ *   证据（反汇编）：sub_5CAC50 的 ecx（this）= 受击单位对象本身 —— 调用点
+ *   sub_5CBBE0+0x4D5 里 ecx=ebx，而 [ebx+0Ch] 正是刚被扣减的 HP；同一对象
+ *   也作为第三参传给 sub_4F35B0 构造 CDamageHandle。它与主 hook 的 arg_8 是
+ *   同一个实例，因此**指针相等即同一次伤害**，可作唯一配对判据。
+ *   新：指针不等 → 跳过（不消费、不发布、不补发）；相等 → 消费并发布。
+ *   同时删掉「槽被挤占即旧事件作废」的记账（0x38 改为 pair_miss 计数）。
+ *   注意：不是「CDamageProperty 指针」—— 两个 hook 各自面对的是不同栈帧上的
+ *   CDamageHandle，property 本体从未暴露给 hook（见 docs/SHM_PROTOCOL.md）。
+ *
  * v10.32（2026-11-26，1.2.0）：**发布权收敛到结算 hook 一处**。
  *   动因：v10.29–v10.31 有 4 条产出路径（结算 hook 正常 / pending 挤占补发 /
  *   槽不可用就地发布 / 结算 hook 未装），只有 1 条带 ty，其余 3 条缺 ty 且 d
  *   退回 ctor 入口口径 —— 同一份 DPS 里混着两种伤害语义，对账闭合不了。
  *   改法：主 hook（sub_4F3FA0）降级为**纯身份登记**，不做任何发布；publish
- *   只在 report_settle 里发生，且必须消费到本次 pending。代价是失配即丢事件
- *   （DISP / NOSLOT 计数），收益是所有事件 ty/d 同源、口径唯一。
+ *   只在 report_settle 里发生，且要求受击对象指针与登记一致（v10.33 收紧）。
+ *   代价是失配即丢事件（PMISS / NOSLOT 计数），收益是事件 ty/d 同源、口径唯一。
  *   附带修正：v10.31 的「ty 退化直读 prop+0x1C」是错的 —— sub_5CAC50 的
  *   arg_0 是 CDamageHandle（12 字节三元组 +0x0C 侧别/+0x04 idA/+0x08 idB），
  *   不是 CDamageProperty，+0x1C 既越界也不含 ty。已删除该分支。
@@ -680,7 +692,7 @@ static DWORD inst_id(DWORD handle, DWORD obj)
                                  * 4 受击者非敌方 8 攻击者非玩家
                                  * 16 missile owner 解析失败
                                  * 32 owner 非玩家 */
-#define META_DIAG_DISP  0x38u   /* 槽被挤占 → 旧事件弃置（不发布）   */
+#define META_DIAG_PMISS 0x38u   /* 结算受击对象 ≠ pending 记录（跳过）*/
 #define META_DIAG_NOSLOT 0x3Cu  /* 主 hook 命中但无槽位 → 事件弃置   */
 /* v10.2 追加：身份判定分布的直方图（定位「误过滤」用的核心证据） */
 #define META_DIAG_HISTA 0x50u   /* atk 类型直方图 [0..7]（16B…共 32B） */
@@ -732,7 +744,7 @@ static void shm_init(void)
     g_meta[META_DIAG_PUB / 4]  = 0;
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
-    g_meta[META_DIAG_DISP / 4] = 0;
+    g_meta[META_DIAG_PMISS / 4] = 0;
     {   int i;
         for (i = 0; i < 8; i++) {
             g_meta[(META_DIAG_HISTA + i * 4) / 4] = 0;
@@ -791,10 +803,11 @@ static void shm_publish(const char *payload, DWORD len)
 /* 配对槽（v10.32 语义）：主 hook 只登记，结算 hook 独占发布权。         */
 /*   主 hook 过滤通过 → 挂 per-thread pending 槽（TLS），不发布；       */
 /*   结算 hook 入口 → 消费 pending，用同一 prop 取 ty/d 后发布。         */
-/*   槽已被占（上一事件未等到结算点）→ 旧事件**丢弃**并计 DISP；         */
+/*   槽已被新节点覆盖 → 旧登记静默消失（不补发、不记账）；              */
 /*   无槽位（结算 hook 未装 / TLS 失败）→ 事件**丢弃**并计 NOSLOT；      */
-/*   结算 hook 命中但无 pending → 跳过并计 NOPD。                        */
-/*   三条丢弃路径的共同点：绝不产出「缺 ty / d 口径不同」的半成品事件。  */
+/*   结算 hook 命中但无 pending → 跳过并计 NOPD；                        */
+/*   v10.33：结算的受击对象指针 ≠ 登记的 vic_obj → 跳过并计 PMISS，     */
+/*   且**不消费** pending（它还在等属于自己的那次结算）。                */
 /* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /* ⚠ 2026-11-20 实跑修正：身份解析必须推迟到 ctor 之后。
@@ -815,6 +828,9 @@ typedef struct {
     DWORD atk_obj, vic_obj;             /* 入口对象指针（arg_4/arg_8）  */
     DWORD used;                         /* pending 占用标志             */
 } pend_t;
+/* v10.33 配对判据 = vic_obj（受击单位对象指针）与结算侧 this 指针相等。
+ * 这个指针在两个 hook 里指的是同一个对象实例，因此是**真指针比较**，不是
+ * 启发式；反汇编依据见文件头 v10.33 条目。 */
 
 static DWORD g_tls_pend = TLS_OUT_OF_INDEXES;
 
@@ -1008,10 +1024,9 @@ static void report_ctor(DWORD atk_obj, DWORD vic_obj, const DWORD *dptr)
         diag_inc(META_DIAG_NOSLOT);
         return;
     }
-    if (p->used) {                       /* 上一事件未等到结算点：丢弃   */
-        p->used = 0;
-        diag_inc(META_DIAG_DISP);
-    }
+    /* 槽只有一个：新节点直接覆盖旧登记。旧登记若还没等到它的结算，就随覆盖
+     * 自然消失 —— 不补发、不记账（v10.33 起连「被挤占」计数都去掉：那不是
+     * 一类需要统计的事件，只是单槽的固有行为）。 */
     p->gf = gf; p->d = dmg;
     p->atk_obj = atk_obj; p->vic_obj = vic_obj;
     p->used = 1;
@@ -1069,12 +1084,17 @@ static BOOL create_hook(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* 副 hook（v10.31）：sub_5CAC50 入口取 CDamageProperty*，读 ty + d2。   */
-/*   arg_0 = [esp+4] → 消费 pending → 带 ty/d2 发布。                     */
+/* 副 hook：sub_5CAC50 入口。                                             */
+/*   ecx   = 受击单位对象（this）→ 与 pending->vic_obj 做指针比较，唯一判据 */
+/*   [esp+4] = CDamageHandle*    → 取 ty（sub_4F1E50）与 d（DCC328）      */
+/*   指针相等才消费并发布；不等直接返回，pending 原样保留。              */
 /*   与主 hook 同技法（入口拦截 + trampoline），无 TLS 偷换，重入安全。  */
 /* ------------------------------------------------------------------ */
 
-static void report_settle(const void *prop)
+static BOOL g_logged_miss = FALSE;       /* 首次指针不符已留证            */
+static BOOL g_logged_ok   = FALSE;       /* 首次配对成功已留证            */
+
+static void report_settle(const void *handle, DWORD vic_obj)
 {
     pend_t *p;
     DWORD ty = 0, d2 = 0, has_ty = 0;
@@ -1085,20 +1105,45 @@ static void report_settle(const void *prop)
         diag_inc(META_DIAG_NOPD);
         return;
     }
-    p->used = 0;                         /* 先消费（失败也走缺省发布）    */
+
+    /* ★ 唯一配对判据（v10.33）：受击单位对象指针相等。
+     *   sub_5CAC50 的 ecx = 受击单位对象（sub_5CBBE0+0x4D5 里 ecx=ebx，
+     *   [ebx+0Ch] 就是刚被扣减的 HP），与主 hook 的 arg_8 是同一实例。
+     *   不等 → 这次结算不属于本次登记：直接返回，**不消费** pending，
+     *   让它继续等属于自己的那次结算。不补发、不跨事件记账。 */
+    if ((DWORD)(UINT_PTR)vic_obj != p->vic_obj) {
+        diag_inc(META_DIAG_PMISS);
+        if (!g_logged_miss) {            /* 首次不符 → DbgView 留证     */
+            char msg[128];
+            g_logged_miss = TRUE;
+            _snprintf(msg, sizeof msg - 1,
+                "[dps] pair miss (first): settle_this=0x%X pend_vic=0x%X",
+                (unsigned)(UINT_PTR)vic_obj, (unsigned)p->vic_obj);
+            OutputDebugStringA(msg);
+        }
+        return;
+    }
+    if (!g_logged_ok) {
+        char msg[128];
+        g_logged_ok = TRUE;
+        _snprintf(msg, sizeof msg - 1,
+            "[dps] pair ok (first): this=0x%X", (unsigned)(UINT_PTR)vic_obj);
+        OutputDebugStringA(msg);
+    }
+    p->used = 0;                         /* 已确认同一次伤害 → 消费       */
 
     /* ① ty：唯一来源 = 游戏自身的 13 键重组器（纯读，无副作用）。
      * ⚠ v10.31 曾在此退化读 prop+0x1C —— 那是错的：sub_5CAC50 的 arg_0 是
      *   CDamageHandle（12 字节三元组：+0x0C 侧别标签 / +0x04 idA / +0x08 idB），
      *   不是 CDamageProperty；+0x1C 既越界也不含 ty。已删除，ty 读不到即省略。 */
-    if (prop && g_fn_ty_reasm) {
-        ty = g_fn_ty_reasm((void *)prop, NULL);
+    if (handle && g_fn_ty_reasm) {
+        ty = g_fn_ty_reasm((void *)handle, NULL);
         has_ty = 1;
     }
 
     /* ② d：属性表里的伤害总量（DCC328，HP 结算实际扣血）；0 = 未设置 */
-    if (prop && g_fn_get_prop)
-        d2 = g_fn_get_prop((void *)prop, NULL,
+    if (handle && g_fn_get_prop)
+        d2 = g_fn_get_prop((void *)handle, NULL,
                            (const void *)((const BYTE *)(UINT_PTR)g_base
                                           + RVA_KEY_D2));
 
@@ -1110,10 +1155,12 @@ __declspec(naked) static void hook_settle(void)
 {
     __asm {
         pushad
-        mov     eax, [esp+36]           /* arg_0 = CDamageProperty*     */
-        push    eax                     /*（[esp+4] + 32B pushad）      */
+        mov     eax, [esp+36]           /* arg_0 = CDamageHandle*（32B+4）*/
+        mov     edx, ecx                /* ecx = this = 受击单位对象     */
+        push    edx                     /* 第 2 参：配对用的指针         */
+        push    eax                     /* 第 1 参：取 ty/d 的 handle    */
         call    report_settle
-        add     esp, 4
+        add     esp, 8
         popad
         jmp     [g_tram_t]              /* 原 5 字节序言 + 回跳          */
     }
@@ -1220,7 +1267,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.32 shm=%d main_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.33 shm=%d main_hook=%d(RVA 0x%X) "
             "settle_hook=%d(RVA 0x%X) ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hooked, HOOK_RVA,
             g_hook_settle, HOOK_SETTLE_RVA,
