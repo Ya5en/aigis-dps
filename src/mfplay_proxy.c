@@ -101,6 +101,20 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.41（2026-11-27）：**DOT key 归因诊断版**（纯诊断，stats 载荷零变更）。
+ *   背景：DOT 类伤害 node 攻击者==受击者（ai=0 分桶），真正归因 id 在
+ *   受击者 +0xEC 条目表的插入 key（= sub_4CA1B0(来源) 归属 id，与 ai/ag
+ *   同一引擎句柄空间，SUB_5CBBE0_DECOMPILE §12/§13）。本版只观测不写入：
+ *   ai==0 且受击者存在生效条目（+0x24 &3==1，同 58A840 判定）的事件，
+ *   只读遍历 MSVC map（深度 20 / 节点预算 64 双护栏）采集：
+ *     key（node+0x10）、entry+0x4C（归属锚点）、entry+0x04（来源单位）。
+ *   诊断计数 0x3C–0x58（diag_ver 4→5）：条目数 / 事件数 / 唯一 key 事件 /
+ *   多 key 事件 / key!=+4C / key!=+04 / key 解析玩家系次数 / 打印行数。
+ *   DbgView keydiag 行预算 200 行（防刷屏），样本 = 首个 distinct key
+ *   经 resolve_cached 的 {ai=CardID, ag=key>>16, RTTI t}。
+ *   目的：实跑验证 ① key 能否过句柄表 gen 校验 ② key 与 +4C/+04 的
+ *   一致性（召唤归并可见性）③ 唯一/多 key 事件占比（写入策略输入）。
+ *
  * v10.40（2026-11-27）：修复 ai/ag 仍全 0——RVA_MGR 换算错误。
  *   根因：dword_4F82980 的 VA 是 0x4F82980（7 位），RVA 应为 0x4B82980；
  *   v10.38/v10.39 误写 0xB82980（把 VA 当 0xF82980 换算，丢了高位 4），
@@ -730,6 +744,20 @@ static DWORD inst_id(DWORD handle, DWORD obj)
                                  *   node+0Ch=0 / Missile owner 读失败） /
                                  * 32 owner 非玩家系                       */
 #define META_DIAG_ZEROD 0x38u   /* hook2 的 d==0 次数（仍发布，d 记 0）   */
+
+/* v10.41 DOT key 诊断（纯观测，不参与发布载荷）。diag_ver 4→5。
+ * 口径：事件 = report_settle 中 ai==0 且受击者存在生效条目的一次结算；
+ * 条目 = 受击者 +0xEC 外层 map → 内层 map 的值（CUnitDynamicProperty），
+ * 生效判定 = entry+0x24 &3==1（与 58A840 tick 一致）。 */
+#define META_DIAG_KENT   0x3Cu   /* 遍历到的生效条目总数                   */
+#define META_DIAG_KEV    0x40u   /* 有生效条目的 ai==0 事件数              */
+#define META_DIAG_KUNIQ  0x44u   /* distinct key 唯一的事件数（可归因候选）*/
+#define META_DIAG_KMULTI 0x48u   /* distinct key>1 或采样溢出的事件数      */
+#define META_DIAG_KMIS4C 0x4Cu   /* key != entry+0x4C 的条目次数           */
+#define META_DIAG_KMISSRC 0x50u  /* key != entry+0x04 的条目次数（召唤可见）*/
+#define META_DIAG_KRES   0x54u   /* key resolve_cached 为玩家系(3..6)次数  */
+#define META_DIAG_KPRT   0x58u   /* keydiag DbgView 已打印行数（预算 200） */
+#define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
 static volatile DWORD *g_meta     = NULL;
@@ -762,7 +790,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 4;
+    g_meta[META_DIAG_VER / 4]  = 5;         /* v10.41：key 诊断计数启用 */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -770,6 +798,14 @@ static void shm_init(void)
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
     g_meta[META_DIAG_ZEROD / 4]= 0;
+    g_meta[META_DIAG_KENT / 4] = 0;
+    g_meta[META_DIAG_KEV / 4]  = 0;
+    g_meta[META_DIAG_KUNIQ/ 4] = 0;
+    g_meta[META_DIAG_KMULTI/4] = 0;
+    g_meta[META_DIAG_KMIS4C/4] = 0;
+    g_meta[META_DIAG_KMISSRC/4]= 0;
+    g_meta[META_DIAG_KRES / 4] = 0;
+    g_meta[META_DIAG_KPRT / 4] = 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -831,6 +867,89 @@ static void diag_inc(DWORD off)
 static void diag_or(DWORD off, LONG bits)
 {
     if (g_meta) InterlockedOr((volatile LONG *)&g_meta[off / 4], bits);
+}
+
+/* ------------------------------------------------------------------ */
+/* v10.41 DOT key 诊断：受击者 +0xEC 条目表只读遍历。                    */
+/*   结构（SUB_5CBBE0_DECOMPILE §12/§13）：                              */
+/*     vic_obj+0xEC = 外层 map（key=效果类型）→ 值 = 内层 map            */
+/*     内层 map node：+0x10 key（= sub_4CA1B0(来源) 归属 id），          */
+/*     +0x14 = CUnitDynamicProperty（+0x24 生效标志 &3==1，              */
+/*     +0x04 来源单位 id，+0x4C 归属锚点 id）。                          */
+/*   MSVC x86 map node：+0 left / +4 parent / +8 right / +0xC _Isnil     */
+/*   （字节）/ +0x10 key / +0x14 value —— 与 sub_4077C0 / sub_48BE20     */
+/*   / sub_54BC00 的取用方式逐一对照核实。                               */
+/* ------------------------------------------------------------------ */
+
+typedef void (*fn_map_visit)(DWORD key, DWORD val, void *ctx);
+
+/* 中序遍历单节点（递归，深度 20 / 预算递减双护栏，全部 safe_read32） */
+static void map_walk_node(DWORD node, fn_map_visit fn, void *ctx,
+                          int depth, int *budget)
+{
+    DWORD l, r, nil, key, val;
+    if (!node || depth > 20 || *budget <= 0) return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)node, &l)) return;
+    map_walk_node(l, fn, ctx, depth + 1, budget);
+    if (*budget <= 0) return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)node + 0xC, &nil)
+        || (nil & 0xFFu))                /* _Isnil 哨兵（含头节点）      */
+        return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)node + 0x10, &key)
+        || !safe_read32((const BYTE *)(UINT_PTR)node + 0x14, &val))
+        return;
+    (*budget)--;
+    fn(key, val, ctx);
+    if (!safe_read32((const BYTE *)(UINT_PTR)node + 8, &r)) return;
+    map_walk_node(r, fn, ctx, depth + 1, budget);
+}
+
+/* map 容器首字段 = 头节点指针，root = 头节点 left */
+static void map_walk(DWORD map_base, fn_map_visit fn, void *ctx, int budget)
+{
+    DWORD head, root;
+    if (!map_base || budget <= 0) return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)map_base, &head) || !head)
+        return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)head, &root)) return;
+    map_walk_node(root, fn, ctx, 0, &budget);
+}
+
+struct keydiag_ctx {
+    DWORD cur_outer;                    /* 外层 key（效果类型）         */
+    DWORD keys[8];                      /* distinct 生效 key 采样 ≤8    */
+    int   nkeys;
+    int   nent;                         /* 生效条目总数                 */
+    int   m_4c, m_src;                  /* key!=+4C / key!=+04 计数     */
+    DWORD last_key, last_4c, last_src, last_outer;
+};
+
+static void keydiag_visit_inner(DWORD key, DWORD val, void *ctxp)
+{
+    struct keydiag_ctx *k = (struct keydiag_ctx *)ctxp;
+    DWORD flag = 0, f4c = 0, src = 0;
+    int  i;
+    if (!val) return;
+    if (!safe_read32((const BYTE *)(UINT_PTR)val + 0x24, &flag)) return;
+    if ((flag & 3u) != 1u) return;       /* 生效过滤，同 58A840          */
+    k->nent++;
+    diag_inc(META_DIAG_KENT);
+    safe_read32((const BYTE *)(UINT_PTR)val + 0x4C, &f4c);
+    safe_read32((const BYTE *)(UINT_PTR)val + 4,    &src);
+    if (f4c != key) { k->m_4c++;  diag_inc(META_DIAG_KMIS4C);  }
+    if (src != key) { k->m_src++; diag_inc(META_DIAG_KMISSRC); }
+    for (i = 0; i < k->nkeys; i++)
+        if (k->keys[i] == key) break;
+    if (i == k->nkeys && k->nkeys < 8) k->keys[k->nkeys++] = key;
+    k->last_key = key; k->last_4c = f4c; k->last_src = src;
+    k->last_outer = k->cur_outer;
+}
+
+static void keydiag_visit_outer(DWORD key, DWORD val, void *ctxp)
+{
+    struct keydiag_ctx *k = (struct keydiag_ctx *)ctxp;
+    k->cur_outer = key;
+    map_walk(val, keydiag_visit_inner, ctxp, 64);
 }
 
 /* 单条发布：has_ty 决定是否输出 ty 字段（缺省不输出）。
@@ -990,6 +1109,48 @@ static void report_settle(const void *handle, DWORD vic_obj)
     safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
     if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
 
+    /* ---------- v10.41 DOT key 诊断（纯观测，不改发布字段） ---------- */
+    /* 触发：ai==0（DOT 自节点 / 攻击者未归因到玩家系）且受击者对象在手。 */
+    if (!ai && vic_obj) {
+        static struct keydiag_ctx kd;
+        void  *kd_obj = NULL;
+        DWORD kd_card = 0, kd_t;
+        kd.nent = 0; kd.nkeys = 0;
+        kd.m_4c = 0; kd.m_src = 0;
+        kd.last_key = 0; kd.last_4c = 0; kd.last_src = 0;
+        kd.last_outer = 0; kd.cur_outer = 0;
+        map_walk((DWORD)(UINT_PTR)vic_obj + 0xEC,
+                 keydiag_visit_outer, &kd, 32);
+        if (kd.nent) {
+            diag_inc(META_DIAG_KEV);
+            if (kd.nkeys == 1)     diag_inc(META_DIAG_KUNIQ);
+            else if (kd.nkeys > 1) diag_inc(META_DIAG_KMULTI);
+            kd_t = resolve_cached(kd.keys[0], &kd_obj, &kd_card);
+            if (kd_t >= 3 && kd_t <= 6) diag_inc(META_DIAG_KRES);
+            /* DbgView 样本行：预算 200 行（防刷屏），读 meta 计数 */
+            if (g_meta
+                && g_meta[META_DIAG_KPRT / 4] < KEYDIAG_PRINT_BUDGET) {
+                char msg[224];
+                diag_inc(META_DIAG_KPRT);
+                _snprintf(msg, sizeof msg - 1,
+                    "[dps] keydiag gf=%lu ty=%lX t=%lu ent=%d nkey=%d "
+                    "k=%lX ai=%lu ag=%lu +4C=%lX src=%lX o=%lX "
+                    "m4c=%d msrc=%d",
+                    (unsigned long)gf, (unsigned long)ty, (unsigned long)kd_t,
+                    kd.nent, kd.nkeys,
+                    (unsigned long)kd.keys[0],
+                    (unsigned long)kd_card,          /* ai 候选 = CardID */
+                    (unsigned long)(kd.keys[0] >> 16), /* ag 候选 = gen */
+                    (unsigned long)kd.last_4c,
+                    (unsigned long)kd.last_src,
+                    (unsigned long)kd.last_outer,
+                    kd.m_4c, kd.m_src);
+                msg[sizeof msg - 1] = '\0';
+                OutputDebugStringA(msg);
+            }
+        }
+    }
+
     if (why) diag_or(META_DIAG_WHY, why);
     if (has_ty) diag_inc(META_DIAG_TYPAIR);
     publish_event(gf, d, ai, ag, vg, vi, has_ty, ty);
@@ -1107,7 +1268,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.40 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.41 shm=%d settle_hook=%d(RVA 0x%X) "
             "node_src=%d ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
