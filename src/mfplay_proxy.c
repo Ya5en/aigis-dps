@@ -101,6 +101,13 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.40（2026-11-27）：修复 ai/ag 仍全 0——RVA_MGR 换算错误。
+ *   根因：dword_4F82980 的 VA 是 0x4F82980（7 位），RVA 应为 0x4B82980；
+ *   v10.38/v10.39 误写 0xB82980（把 VA 当 0xF82980 换算，丢了高位 4），
+ *   读到 .data 内另一个无关 dword → node 查找恒败（why|=16）→ ai/ag 全 0。
+ *   依据：PE 头 SizeOfImage=0x4CF9000（.data RVA 0xB28000 + 0x40EFC34），
+ *   VA 0x4F82980 落在 .data 内，符号有效。其余 RVA 均来自 6 位 VA，未受影响。
+ *
  * v10.39（2026-11-27）：修复 v10.38 的 ai/ag 全 0——管理器全局现读。
  *   根因：dword_4F82980 是惰性创建的全局（4F0xxx 属性家族内多处
  *   `mov dword_4F82980, edi/ebx` 运行时写入，首次使用伤害属性系统时才有值），
@@ -266,7 +273,10 @@ static const BYTE PROLOGUE_TY_REASM[3] = { 0x56, 0x57, 0x68 };
  * init 时必为 0 —— v10.38 曾在 init 读一次缓存，导致整场 ai/ag=0（v10.39
  * 修正为每次结算现读）。 */
 #define RVA_NODE_LOOKUP 0xF4B50  /* sub_4F4B50 → node*（0 = 查无）         */
-#define RVA_MGR         0xB82980 /* dword_4F82980：伤害属性管理器指针      */
+#define RVA_MGR         0x4B82980/* dword_4F82980（VA 0x4F82980−0x400000）：
+                                  * 伤害属性管理器指针。⚠ v10.39 及之前误写
+                                  * 0xB82980（把 VA 当 0xF82980），读到的不是
+                                  * 管理器 → node 查找恒败 → ai/ag 全 0。     */
 static const BYTE PROLOGUE_NODE_LOOKUP[5] = { 0x55, 0x8B, 0xEC, 0x56, 0x57 };
 
 /* GameFrame（dword_F51838，官方 API 注册于 sub_B1B0F0）：
@@ -1097,7 +1107,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.39 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.40 shm=%d settle_hook=%d(RVA 0x%X) "
             "node_src=%d ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
