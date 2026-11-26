@@ -1,10 +1,13 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 正式发布版 1.1.0（PRD v1.7，实现版本 v10.31）
+ * aigis-dps / mfplay_proxy.c —— 正式发布版 1.4.0（PRD v1.7，实现版本 v10.36）
  *
- * 业务：主 hook（sub_4F3FA0，RVA 0xF3FA0，CDamageHandle ctor / 伤害节点诞生点）
- * 命中时从入口参数直接取得「攻击者对象 / 受击者对象 / 伤害值指针」，在 DLL 内
- * 完成 GetHandle + resolve + DPS 语义过滤，以一行 JSON 经命名共享内存环形缓冲
- * （Local\aigis_dps）转发给接收端。
+ * 业务：dps 统计。两个 hook，职责分层：
+ *   hook1  sub_4F3FA0（CDamageHandle ctor / 三条创建路径的唯一漏斗）
+ *          从入口参数取「攻击者对象 / 受击者对象」，在 DLL 内完成
+ *          GetHandle + resolve + DPS 语义过滤，得到 ai/ag/vg/vi 直传。
+ *   hook2  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
+ *          取用身份，填 gf / d（DCC328 实扣血）/ ty（13 键重组）后发布。
+ * 一行 JSON 经命名共享内存环形缓冲（Local\aigis_dps）转发给接收端。
  *
  * 为何换点（PRD v1.5 / FINDINGS §32）：旧查表点 sub_4F4B50 每次结算被引擎重复
  * 查询 25-83x（battle10：88458 条 prop 仅 ~78 个节点），需要 run-length 折叠兜底；
@@ -39,20 +42,20 @@
  *     vi = 受击者种类键 = 模式槽索引 = (*( *(vic+4) + 5Ch ) − 0x200000) >> 4
  *          （PatternID 函数 RVA 落 .text 模式处理区、16B 对齐；与实机点阵
  *          逐一对照验证无误；越界/不可读 = 0）
- *     d  = 伤害值。取结算 hook 处的属性表伤害总量
- *          （sub_4F13B0(handle,&dword_DCC328) = HP 结算实际扣血）；读到 0
- *          （未设置）时退回主 hook 直传的 *arg_C 入口值。
+ *     d  = 伤害值 = 属性表伤害总量（sub_4F13B0(handle,&dword_DCC328)，
+ *          即 HP 结算实际扣血）。唯一来源；读到 0 = 本次未扣血，整条丢弃。
  *     ty = 伤害结算标志集 = 结算 hook（sub_5CAC50）入参 arg_0（CDamageHandle*）
  *          → sub_4F1E50 13 键 OR 重组取得完整 dword（纯读无副作用）。
  *          位域 bit0~21：bit0=Magic、bit6=Critical、bit7=紫档基线等，
  *          详见 FINDINGS §44。
- *          v10.34：发布只发生在结算 hook，无配对环节，因此「事件缺 ty」
- *          只剩 ty_src=0（sub_4F1E50 序言漂移）一种成因。
+ *          发布只发生在结算 hook，无配对环节，因此「事件缺 ty」只有
+ *          ty_src=0（sub_4F1E50 序言漂移）一种成因。
  *          **可选字段恒在末位**：带/不带 ty 的事件共享稳定前缀。
  *
- * v10.2（2026-11-20 实跑修正）：身份解析从 ctor 入口推迟到副 hook（ctor 之后）。
- *   sub_AAEFC0 的句柄是惰性创建的，且在 4F4xxx 内只被 4F3FA0 自己调用——入口处
- *   导弹等一次性对象的句柄缓存必为 0，导致「少数正确、大量误过滤」。
+ * 身份解析时机（v10.36）：在 ctor 入口（hook1）做。arg_4/arg_8 就是伤害载体
+ *   对象本身，identify 先走句柄路径（与引擎同源），失败退化到直接 RTTI；
+ *   导弹额外走 [Missile+0x48] owner 句柄归因，不依赖自身的惰性句柄。
+ *   句柄可用 → ag/vg 取真 gen；不可用 → 退化为对象指针低位（同场次内稳定）。
  *
  * v10.23（2026-11-20 定案）：移除 ve（EnemyID）全链路（spawn hook / EIDM /
  *   行键读取 / RDMP 采样）与全部离线探针（VSMP/ROWP/CTNR/P404）；vi 定稿为
@@ -96,56 +99,31 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
- * v10.35（2026-11-26，1.3.1）：**受击方来源还原为 ctor 的 arg_8**。
- *   v10.33/v10.34 曾把受击方改成结算 hook 的 ecx（this）。实测口径不对：
- *   vi（种类键）与 vg（实例 gen）都依赖「被 identify 的那个对象就是 ctor
- *   收到的受击单位」——ecx 是结算侧的显示/单位上下文，与 ctor 的 arg_8
- *   不保证同一实例，一旦不同 → vt≠1 整条丢弃，或 vi/vg 取到错对象。
- *   还原：主 hook 直传 (atk_obj, vic_obj, d) 三个 DWORD，结算 hook 取用后
- *   清零；vi/vg 的判定逻辑与路径**完全回到 v10.2–v10.31 原样**，一行未改。
- *
- * v10.34（2026-11-26，1.3.0）：**删除配对与缓存**——战斗模拟全程单线程。
- *   删：TLS 槽（TlsAlloc/TlsGetValue/HeapAlloc）、pend_t 状态、used 标志、
- *       指针判据、pair_miss/no_slot/pend 计数、首次配对日志、GF 缓存。
- *   留：主 hook 只写 g_atk/g_vic/g_d 三个 DWORD；结算 hook 取用后清零。
- *   配对消失后「怎么保证一一对应」的答案是**顺序本身**：单线程里 ctor 一定在
- *   它自己的结算之前、且之间不会有别的 ctor 抢先（同节点内串行），所以
- *   「最近一次赋值」就是「本次结算的那一个」，不需要任何判据。
- *   代价：若某次 ctor 之后没有结算（事件被上层丢弃），g_atk 会留到下一次
- *   结算 —— 已用「取用即清零 + 结算无值则跳过(NOPD)」把影响限制在一条事件。
- *
- * v10.33（2026-11-26，1.2.1）：配对判据改为**受击单位对象指针相等**。
- *   旧（v10.32）：结算 hook 命中即无条件消费 pending —— 只要这次结算到来，
- *   不管它是不是 pending 记的那一次伤害，都拿 pending 的 atk/vic 发布。
- *   证据（反汇编）：sub_5CAC50 的 ecx（this）= 受击单位对象本身 —— 调用点
- *   sub_5CBBE0+0x4D5 里 ecx=ebx，而 [ebx+0Ch] 正是刚被扣减的 HP；同一对象
- *   也作为第三参传给 sub_4F35B0 构造 CDamageHandle。它与主 hook 的 arg_8 是
- *   同一个实例，因此**指针相等即同一次伤害**，可作唯一配对判据。
- *   新：指针不等 → 跳过（不消费、不发布、不补发）；相等 → 消费并发布。
- *   同时删掉「槽被挤占即旧事件作废」的记账（0x38 改为 pair_miss 计数）。
- *   注意：不是「CDamageProperty 指针」—— 两个 hook 各自面对的是不同栈帧上的
- *   CDamageHandle，property 本体从未暴露给 hook（见 docs/SHM_PROTOCOL.md）。
- *
- * v10.32（2026-11-26，1.2.0）：**发布权收敛到结算 hook 一处**。
- *   动因：v10.29–v10.31 有 4 条产出路径（结算 hook 正常 / pending 挤占补发 /
- *   槽不可用就地发布 / 结算 hook 未装），只有 1 条带 ty，其余 3 条缺 ty 且 d
- *   退回 ctor 入口口径 —— 同一份 DPS 里混着两种伤害语义，对账闭合不了。
- *   改法：主 hook（sub_4F3FA0）降级为**纯身份登记**，不做任何发布；publish
- *   只在 report_settle 里发生。（v10.34 起登记退化为两个 DWORD 直传。）
- *   附带修正：v10.31 的「ty 退化直读 prop+0x1C」是错的 —— sub_5CAC50 的
- *   arg_0 是 CDamageHandle（12 字节三元组 +0x0C 侧别/+0x04 idA/+0x08 idB），
- *   不是 CDamageProperty，+0x1C 既越界也不含 ty。已删除该分支。
+ * v10.36（2026-11-26，1.4.0）：**架构定稿**——hook1 解析身份，hook2 补时间与数值。
+ *   hook1（sub_4F3FA0，ctor 入口）完成全部身份解析并直传 ai/ag/vg/vi 四项，
+ *   同时做完 DPS 语义过滤（受击者必须为敌方、攻击链终点必须是玩家侧）。
+ *   hook2（sub_5CAC50，结算点）取用这四项，填入 gf（结算帧）、d（DCC328 实际
+ *   扣血）、ty（sub_4F1E50 13 键重组）后发布。
+ *   战斗模拟全程单线程，hook1 必在自己的结算之前且中间不插别的 ctor，因此
+ *   hook1→hook2 用文件作用域变量直传即可，无配对、无判据、无缓存。
+ *   本版删除（均为历次简化留下的空壳或死分支）：
+ *     · 诊断位 0x20/0x38/0x3C/0x50–0x70/0x90–0xA0（pending、补发、直方图、
+ *       回退计数、last_* 采样）；0x20 复用为 no_prev。
+ *     · ctor 侧 d 回退（d 只有一个来源：DCC328，读不到即丢弃该条）。
+ *     · why_bits bit2 死分支（参数为空改为在 hook1 内计数，可达）。
+ *     · v10.32–v10.35 期间的解释性段落（其结论已并入上表）。
+ *   保留的技术事实：sub_5CAC50 的 arg_0 是 CDamageHandle*（12 字节三元组：
+ *   +0x0C 侧别 / +0x04 idA / +0x08 idB），属性值必须经 sub_4F13B0(handle,key) 取，
+ *   +0x1C 不是 ty。
  *
  * v10.31（2026-11-26，1.1.0）：副 hook 换点 sub_4F18A0 → sub_5CAC50。
  *   新点入参一次可取两样：
  *   ① ty = sub_4F1E50(prop)，游戏自身的 13 键 OR 重组器（纯读无副作用），
  *      比 direct dword 读更完整。
- *   ② d  = sub_4F13B0(prop, &dword_DCC328)，HP 结算实际扣血总量；读到 0
- *      时退回 ctor 侧 *arg_C。协议布局不变，d 语义改为「结算总扣血」。
+ *   ② d  = sub_4F13B0(prop, &dword_DCC328)，HP 结算实际扣血总量。
  *   覆盖说明：sub_5CAC50 被敌方侧结算主函数 sub_5CBBE0 无条件调用（函数
  *   内部护盾为 0 只影响表现，不影响 hook 命中），但它是「结算点」而非
- *   「ctor 紧邻点」，多条伤害节点并入同一次结算时 pending 会被后写覆盖。
- *   （该覆盖问题在 v10.32 由「丢弃 + 计数」处理，不再补发半成品事件。）
+ *   「ctor 紧邻点」；hook1 只直传身份，同一节点多目标时会复用同一份身份。
  *
  * 1.0.0（2026-11-22）：首个正式发布版。项目层版本号（semver）与内部实现
  *   版本号（v10.x 沿革）从此并行：1.0.0 对应实现 v10.29；DbgView init 行
@@ -238,11 +216,11 @@ static const BYTE EXPECT_PROLOGUE[HOOK_PATCH_LEN] =
 /* 副 hook（v10.31 换点）：sub_5CAC50（VA 0x5CAC50 / RVA 0x1CAC50）——
  * 敌方侧结算主函数 sub_5CBBE0+0x4D5 的「受击表现」子步骤，**无条件调用**
  * （函数内部护盾为 0 只是早退，入口 hook 照常命中）。
- *   arg_0 = CDamageProperty*（不再是 ty 指针），据此一次取两样：
- *     ty ← sub_4F1E50(prop)：13 键 OR 重组的完整 dword（纯读，无副作用）；
- *           序言不符/未解析时退化为 prop+0x1C 直读（原 4F18A0 同源缓存）。
- *     d2 ← sub_4F13B0(prop, &dword_DCC328)：HP 结算实际扣血总量；
- *           读到 0（未设置）则退回 ctor 侧 d。
+ *   arg_0 = CDamageHandle*（12 字节三元组，**不是** CDamageProperty）：
+ *     ty ← sub_4F1E50(handle)：13 键 OR 重组的完整 dword（纯读，无副作用）；
+ *           序言不符 → ty_src=0，该字段整场省略。
+ *     d  ← sub_4F13B0(handle, &dword_DCC328)：HP 结算实际扣血；
+ *           读到 0 = 本次未扣血，整条丢弃。
  * prologue: push ebp / mov ebp,esp / and esp,-8 = 55 8B EC 83 E4 F8，
  * 取前 5 字节作漂移签名（MinHook 自行按完整指令重定位，不要求对齐）。 */
 #define HOOK_SETTLE_RVA       0x1CAC50
@@ -250,7 +228,7 @@ static const BYTE EXPECT_PROLOGUE[HOOK_PATCH_LEN] =
 static const BYTE EXPECT_PROLOGUE_SETTLE[HOOK_SETTLE_PATCH_LEN] =
         { 0x55, 0x8B, 0xEC, 0x83, 0xE4 };
 
-/* 属性读取原语（v10.31）：调用前二次校验序言，不符则该项降级，绝不乱调。 */
+/* 属性读取原语：调用前二次校验序言，不符则该函数指针保持 NULL，绝不乱调。 */
 #define RVA_GET_PROP   0xF13B0   /* sub_4F13B0(prop,key) → u32，0 = 未设置 */
 #define RVA_TY_REASM   0xF1E50   /* sub_4F1E50(prop) → ty dword            */
 #define RVA_KEY_D2     0x9CC328  /* dword_DCC328（VA 0xDCC328）= 伤害总量  */
@@ -266,7 +244,7 @@ static BOOL        g_hooked  = FALSE;
 static void       *g_tram    = NULL;    /* sub_4F3FA0 的 trampoline       */
 static void       *g_tram_t  = NULL;    /* 副 hook trampoline（保留旧名） */
 
-/* 属性读取原语（v10.31）：init 时按序言校验后填充，NULL = 不可用 → 降级。 */
+/* 属性读取原语：init 时按序言校验后填充，NULL = 不可用（该字段随之缺省）。 */
 /* 目标函数均为 __thiscall（ecx = prop）。C 模式不支持 __thiscall 函数指针，
  * 用 __fastcall 等价映射：第 1 参 → ecx、第 2 参 → edx、其余入栈。 */
 typedef DWORD (__fastcall *fn_get_prop)(void *prop, void *unused_edx,
@@ -274,7 +252,7 @@ typedef DWORD (__fastcall *fn_get_prop)(void *prop, void *unused_edx,
 typedef DWORD (__fastcall *fn_ty_reasm)(void *prop, void *unused_edx);
 static fn_get_prop g_fn_get_prop = NULL;
 static fn_ty_reasm g_fn_ty_reasm = NULL;
-static BOOL        g_hook_settle = FALSE;   /* 副 hook 安装状态（ty 降级开关）*/
+static BOOL        g_hook_settle = FALSE;   /* hook2（发布点）安装状态      */
 
 /* ------------------------------------------------------------------ */
 /* 页级可读性预检（不触发异常、不走 SEH 分发）+ VEH 探针护盾            */
@@ -692,32 +670,21 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_SEQ_TOTAL  0x40u
 #define META_OLDEST     0x48u
 
-/* 诊断区（可选，写入方只有 DLL；reader 可忽略。正式版可全 0）
- * 作用：定位「SHM 无数据」时报卡在哪一级：hook 未命中 / 全量过滤 /
- * ty 配对卡死 / 发布失败。字段语义见 docs/SHM_PROTOCOL.md §4.3。 */
-#define META_DIAG_VER   0x10u   /* 诊断块版本 = 1                   */
-#define META_DIAG_FLAGS 0x14u   /* bit0 主hook bit1 tyhook bit2 shm bit3 crchook */
-#define META_DIAG_CTOR  0x18u   /* 主 hook 命中次数                 */
-#define META_DIAG_DROP  0x1Cu   /* 语义过滤丢弃次数                 */
-#define META_DIAG_PEND  0x20u   /* [废弃·恒 0] 原挂入 pending 次数    */
-#define META_DIAG_TYHIT 0x24u   /* 副 hook 命中次数                 */
-#define META_DIAG_TYPAIR 0x28u  /* 带 ty 发布次数（≈ published）    */
-#define META_DIAG_PUB   0x2Cu   /* 实际发布条数                     */
-#define META_DIAG_GF    0x30u   /* 最近一次读到的 gf                */
-#define META_DIAG_WHY   0x34u   /* 丢弃原因位：1 d==0 2 攻击者无法识别
-                                 * 4 受击者非敌方 8 攻击者非玩家
-                                 * 16 missile owner 解析失败
-                                 * 32 owner 非玩家 */
-#define META_DIAG_RSVD38 0x38u  /* [废弃·恒 0] 原 pend_displaced / pair_miss */
-#define META_DIAG_RSVD3C 0x3Cu  /* [废弃·恒 0] 原 no_slot                    */
-/* v10.2 追加：身份判定分布的直方图（定位「误过滤」用的核心证据） */
-#define META_DIAG_HISTA 0x50u   /* atk 类型直方图 [0..7]（16B…共 32B） */
-#define META_DIAG_HISTV 0x70u   /* vic 类型直方图 [0..7]               */
-#define META_DIAG_FB    0x90u   /* 走「直接 RTTI 回退」的次数          */
-#define META_DIAG_NOPD  0x94u   /* 结算 hook 命中但无前置 ctor 次数    */
-#define META_DIAG_LASTA 0x98u   /* 最近一次 atk 类型                   */
-#define META_DIAG_LASTV 0x9Cu   /* 最近一次 vic 类型                   */
-#define META_DIAG_LASTW 0xA0u   /* 最近一次丢弃原因位                  */
+/* 诊断区（reader 可忽略；写入方只有 DLL）。只留「链路断在哪一级」的计数：
+ * hook1 未命中 / 被语义过滤 / hook2 未命中 / 无 hook1 身份 / 发布成功。 */
+#define META_DIAG_VER   0x10u   /* 诊断块版本 = 2                         */
+#define META_DIAG_FLAGS 0x14u   /* bit0 hook1 bit1 hook2 bit2 shm         */
+#define META_DIAG_CTOR  0x18u   /* hook1 命中次数                         */
+#define META_DIAG_DROP  0x1Cu   /* 丢弃次数（语义过滤或 d==0）            */
+#define META_DIAG_NOPREV 0x20u  /* hook2 命中但没有 hook1 身份            */
+#define META_DIAG_TYHIT 0x24u   /* hook2 命中次数                         */
+#define META_DIAG_TYPAIR 0x28u  /* 带 ty 的发布次数                       */
+#define META_DIAG_PUB   0x2Cu   /* 实际发布条数                           */
+#define META_DIAG_GF    0x30u   /* 最近一次发布的 gf                      */
+#define META_DIAG_WHY   0x34u   /* 丢弃原因位：1 d==0 / 2 参数为空 /
+                                 * 4 受击者非敌方 / 8 攻击者非玩家系 /
+                                 * 16 missile owner 解析失败 /
+                                 * 32 owner 非玩家系                       */
 static HANDLE         g_shm_map  = NULL;
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
 static volatile DWORD *g_meta     = NULL;
@@ -750,29 +717,16 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 1;
+    g_meta[META_DIAG_VER / 4]  = 2;
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_CTOR / 4] = 0;
     g_meta[META_DIAG_DROP / 4] = 0;
-    g_meta[META_DIAG_PEND / 4] = 0;
+    g_meta[META_DIAG_NOPREV / 4] = 0;
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
     g_meta[META_DIAG_PUB / 4]  = 0;
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
-    g_meta[META_DIAG_RSVD38 / 4] = 0;
-    g_meta[META_DIAG_RSVD3C / 4] = 0;
-    {   int i;
-        for (i = 0; i < 8; i++) {
-            g_meta[(META_DIAG_HISTA + i * 4) / 4] = 0;
-            g_meta[(META_DIAG_HISTV + i * 4) / 4] = 0;
-        }
-    }
-    g_meta[META_DIAG_FB / 4]    = 0;
-    g_meta[META_DIAG_NOPD / 4]  = 0;
-    g_meta[META_DIAG_LASTA / 4] = 0;
-    g_meta[META_DIAG_LASTV / 4] = 0;
-    g_meta[META_DIAG_LASTW / 4] = 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -817,26 +771,19 @@ static void shm_publish(const char *payload, DWORD len)
 }
 
 /* ------------------------------------------------------------------ */
-/* 单线程直传（v10.34）：整个战斗模拟是单线程的，因此**不再有配对**。    */
-/*   主 hook 只做一次赋值：攻击者 + 受击者 + 伤害值 + GameFrame；       */
-/*   结算 hook 直接取用（取完清零）。                                    */
-/*   没有 TLS、没有槽位状态、没有匹配判据、没有补发、没有跨事件计数。    */
-/*   v10.35：受击者仍是 ctor 的 arg_8（不是结算侧 ecx）—— vi/vg 的       */
-/*   判定对象必须是 ctor 收到的那个受击单位；gf 也回到 ctor 时刻读取。   */
+/* hook1 → hook2 直传（v10.36）                                          */
+/*   战斗模拟全程单线程：hook1 在 ctor 入口解析完身份后写这里，hook2 在同 */
+/*   一次伤害的结算点取用并清零。顺序本身即一一对应，无配对、无判据。     */
 /* ------------------------------------------------------------------ */
-/* ⚠ 为什么仍要保留主 hook：身份解析必须推迟到 ctor 之后。
- *
- * GetHandle（sub_AAEFC0）是**惰性创建**语义：
- *     p = [this+0x34]; h = [p+0xC]; if (!h) h = create(this), [p+0xC] = h;
- * 而整个 4F4xxx 区间内 call 0xaaefc0 只出现在 ctor 内部的两处（攻击者/受击者）
- * —— 句柄是在 ctor 里才被创建的。所以「攻击者对象指针」只能在 ctor 入口取到、
- * 在结算点才可解析；而结算侧只有 CDamageHandle（键值）与受击单位 this，
- * 反查不到攻击者对象，也反查不到「ctor 认定的受击单位」。
- * 故主 hook 保留，只存三个 DWORD，不做任何判断。 */
-static DWORD g_atk = 0;      /* 最近一次 ctor 的攻击者对象指针（用后清零）*/
-static DWORD g_vic = 0;      /* 最近一次 ctor 的受击者对象指针（同上）   */
-static DWORD g_d   = 0;      /* 同一节点的入口伤害值（d 的回退口径）     */
-static DWORD g_gf  = 0;      /* 同一节点的 GameFrame（时间轴，同口径）   */
+typedef struct {
+    DWORD ai;        /* 攻击者 CardID（玩家系直接取，导弹取其 owner 的） */
+    DWORD ag;        /* 攻击者实例 gen（句柄高 16 位）                   */
+    DWORD vg;        /* 受击者实例 gen                                   */
+    DWORD vi;        /* 受击者种类键（模式槽索引，0 = 不可读）           */
+} ident_t;
+
+static ident_t g_id;                 /* 待结算事件的身份                   */
+static BOOL    g_id_ok = FALSE;      /* TRUE = g_id 属于本次待结算事件     */
 
 /* 诊断计数器（写入方独占，reader 只读；失败静默） */
 static void diag_inc(DWORD off)
@@ -896,44 +843,38 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
 }
 
 /* ------------------------------------------------------------------ */
-/* resolve_publish：身份解析 + DPS 语义过滤 + 发布                       */
-/*   v10.34 起由 report_settle 直接调用，入参全部是值（无共享状态）。    */
-/*   调用时机在 ctor 返回之后，ctor 内的两次 GetHandle 已把句柄建好。    */
+/* report_ctor（hook1）：ctor 入口，解析身份 + DPS 语义过滤 + 直传。      */
+/*   arg_4 攻击者对象 / arg_8 受击者对象（game 自身在任一为 0 时早退）。  */
+/*   这里不发布、不碰时间轴、不碰伤害值 —— gf/d/ty 全部归 hook2。        */
+/*   过滤失败时不发布，并把 g_id_ok 置 FALSE：结算侧拿不到身份就整条跳过， */
+/*   不会复用上一条事件。                                                */
 /* ------------------------------------------------------------------ */
 
-static void resolve_publish(DWORD gf, DWORD atk_obj, DWORD vic_obj,
-                            DWORD d_ctor, DWORD has_ty, DWORD ty, DWORD d_ov)
+static void report_ctor(DWORD atk_obj, DWORD vic_obj)
 {
-    DWORD atk_h = 0, vic_h = 0;
-    DWORD at, vt, ai = 0, ag = 0, vg = 0;
+    DWORD atk_h = 0, vic_h = 0, at, vt;
+    DWORD ai = 0, ag = 0, vg = 0, vi = 0;
     void *aobj = NULL, *vobj = NULL, *oobj = NULL;
     DWORD acard = 0, vcard = 0, ocard = 0;
-    int   fb_a = 0, fb_v = 0;
     LONG  why = 0;
 
-    if (!atk_obj || !vic_obj) {          /* ctor 自身早退条件：不该到这 */
-        diag_or(META_DIAG_WHY, 2);
-        goto drop;
-    }
+    if (!g_shm) return;                  /* SHM 创建失败 → 通道静默禁用    */
+    diag_inc(META_DIAG_CTOR);            /* 诊断：hook1 命中               */
 
-    vt = identify(vic_obj, &vic_h, &vobj, &vcard, &fb_v);
-    at = identify(atk_obj, &atk_h, &aobj, &acard, &fb_a);
-    if (fb_a || fb_v) diag_inc(META_DIAG_FB);
+    /* 先作废：本次若被过滤，结算侧不得复用上一条身份 */
+    g_id_ok = FALSE;
 
-    /* 判定分布直方图（诊断「误过滤」的核心证据） */
-    if (g_meta) {
-        g_meta[(META_DIAG_HISTA + (at & 7) * 4) / 4]++;
-        g_meta[(META_DIAG_HISTV + (vt & 7) * 4) / 4]++;
-        g_meta[META_DIAG_LASTA / 4] = at;
-        g_meta[META_DIAG_LASTV / 4] = vt;
-    }
+    if (!atk_obj || !vic_obj) { why |= 2; goto drop; }
+
+    vt = identify(vic_obj, &vic_h, &vobj, &vcard, NULL);
+    at = identify(atk_obj, &atk_h, &aobj, &acard, NULL);
 
     /* 受击者必须为敌方（vt == 1），其余一律丢弃 */
     if (vt != 1) { why |= 4; goto drop; }
 
-    /* 攻击链终点必须为玩家侧（at/ot ∈ {3,4,5,6}） */
+    /* 攻击链终点必须为玩家侧（3..6）；导弹走 owner 归因 */
     if (at == 2) {
-        /* Missile 归因：owner 句柄 = [Missile+0x48]（ctor sub_442C40 实锤）。
+        /* Missile owner 句柄 = [Missile+0x48]（ctor sub_442C40 实锤）。
          * 该句柄在导弹创建时就已存在，与惰性缓存无关。 */
         DWORD ow_h = 0, ot;
         if (!aobj || !safe_read32((const BYTE *)aobj + 0x48, &ow_h) || !ow_h) {
@@ -950,72 +891,40 @@ static void resolve_publish(DWORD gf, DWORD atk_obj, DWORD vic_obj,
         why |= 8; goto drop;             /* 敌方 / 未知 / 解析失败 */
     }
 
-    if (g_meta) g_meta[META_DIAG_LASTW / 4] = 0;   /* 清掉上次丢弃原因 */
-
-    /* 受击方标识：与 ag 同构（句柄 gen，缺失时退化为指针低位）。
-     * 受击者经 vt==1 过滤后必为 Enemy，所以 vg 恒有值。 */
+    /* 受击方实例 gen：经 vt==1 过滤后必为 Enemy，恒有值 */
     vg = inst_id(vic_h, vic_obj);
 
-    /* 受击方种类键 vi（v10.22 定稿）：模式槽索引 = (pval − 0x200000) >> 4。
-     * pval = *( *(vobj+4) + 5Ch )，落 .text 0x201250–0x2129E0 模式处理代码区、
+    /* 受击方种类键 vi：模式槽索引 = (pval − 0x200000) >> 4。
+     * pval = *( *(vobj+4) + 5Ch )，落 .text 0x201250–0x2129E0 模式代码区、
      * 16 字节对齐，右移 4 即槽号（与实机点阵逐一对照验证无误）。
      * 例：0x212990 → 4761。越界/不可读时置 0（前端单列一桶）。 */
     {
-        DWORD param = 0, pval = 0, vi = 0;
+        DWORD param = 0, pval = 0;
         if (vobj && safe_read32((const BYTE *)vobj + 4, &param) && param >= 0x10000) {
             safe_read32((const BYTE *)(UINT_PTR)param + 0x5C, &pval);
             if (pval >= 0x200000u && pval < 0x400000u)
                 vi = (pval - 0x200000u) >> 4;
         }
-        /* d_ov = 属性表伤害总量（DCC328），非 0 优先于 ctor 侧读数 */
-        publish_event(gf, d_ov ? d_ov : d_ctor, ai, ag, vg, vi, has_ty, ty);
     }
+
+    g_id.ai = ai;
+    g_id.ag = ag;
+    g_id.vg = vg;
+    g_id.vi = vi;
+    g_id_ok = TRUE;
     return;
 
 drop:
     if (why) diag_or(META_DIAG_WHY, why);
-    if (g_meta) g_meta[META_DIAG_LASTW / 4] = (DWORD)why;
     diag_inc(META_DIAG_DROP);
 }
 
 /* ------------------------------------------------------------------ */
-/* report_ctor：主 hook 入口，只做赋值，不做任何判断。                    */
-/*   atk/vic 为对象指针（game 自身在任一为 0 时直接返回，同步过滤），     */
-/*   dptr 为伤害值指针（入口即终值）。                                    */
-/*   v10.34 去掉了 TLS / 槽位标志；v10.35 起直传 (gf, atk, vic, d) 四项。*/
-/* ------------------------------------------------------------------ */
-
-static void report_ctor(DWORD atk_obj, DWORD vic_obj, const DWORD *dptr)
-{
-    DWORD dmg, gf;
-
-    if (!g_shm) return;                  /* SHM 创建失败 → 通道静默禁用    */
-    diag_inc(META_DIAG_CTOR);            /* 诊断：主 hook 命中             */
-
-    if (!atk_obj || !vic_obj) return;    /* 与 game 自身早退条件一致       */
-    if (!safe_read32(dptr, &dmg) || dmg == 0) {
-        diag_or(META_DIAG_WHY, 1);
-        return;
-    }
-    /* 时间轴：GameFrame（暂停/倍速免疫）—— 与 v10.2–v10.34 同口径，
-     * 在 ctor 入口读一次随事件带走，不在结算时刻另行读取。 */
-    gf = 0;
-    safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
-    if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
-
-    g_atk = atk_obj;
-    g_vic = vic_obj;
-    g_d   = dmg;
-    g_gf  = gf;
-}
-
-/* ------------------------------------------------------------------ */
 /* 主 hook 本体（v1.5 入口拦截）：参数在入口栈上全量可得，无需偷换返回  */
-/* 地址 —— pushad 全寄存器保护 → 取栈上 arg_4/arg_8/arg_C 调 report    */
-/* → popad → jmp trampoline。无 TLS 状态，天然重入安全（节点创建路径   */
-/* 嵌套也不产生状态覆写问题）。                                        */
+/* 地址 —— pushad 全寄存器保护 → 取栈上 arg_4/arg_8 调 report_ctor     */
+/* → popad → jmp trampoline。无 TLS 状态，天然重入安全。               */
 /* 入口栈布局：[esp]=ret / [esp+4]=arg_0（不消费）/ [esp+8]=arg_4 攻击 */
-/* 者对象 / [esp+0C]=arg_8 受击者对象 / [esp+10]=arg_C 伤害值指针。    */
+/* 者对象 / [esp+0C]=arg_8 受击者对象。                                */
 /* ------------------------------------------------------------------ */
 
 __declspec(naked) static void hook_ctor(void)
@@ -1024,12 +933,10 @@ __declspec(naked) static void hook_ctor(void)
         pushad
         mov     eax, [esp+40]           /* arg_4 攻击者对象（32B+8）    */
         mov     ecx, [esp+44]           /* arg_8 受击者对象             */
-        mov     edx, [esp+48]           /* arg_C 伤害值指针             */
-        push    edx
         push    ecx
         push    eax
         call    report_ctor
-        add     esp, 12
+        add     esp, 8
         popad
         jmp     [g_tram]                /* 原函数 8 字节序言 + 回跳      */
     }
@@ -1060,45 +967,50 @@ static BOOL create_hook(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* report_settle：结算 hook 入口，直接发布，不做任何配对判断。            */
-/*   [esp+4] = CDamageHandle* → ty（sub_4F1E50）+ d（DCC328）。          */
-/*   攻击者/受击者取主 hook 直传的 g_atk / g_vic，取完清零 —— 单线程顺序 */
-/*   即正确性的全部保证，没有槽位、没有状态机。                          */
-/*   v10.35：受击方**不取** ecx；vi/vg 必须基于 ctor 的 arg_8 解析。     */
+/* report_settle（hook2）：唯一发布点。                                   */
+/*   [esp+4] = CDamageHandle* → ty（sub_4F1E50 13 键重组）+ d（DCC328）。 */
+/*   取 hook1 直传的 ai/ag/vg/vi（取用即清零）→ 填 gf（结算帧 GameFrame） */
+/*   → 发布。d 只认 DCC328：读到 0 说明本次未扣血，整条丢弃。             */
 /* ------------------------------------------------------------------ */
 
 static void report_settle(const void *handle)
 {
-    DWORD atk_obj, vic_obj, d_ctor, gf;
-    DWORD ty = 0, d2 = 0, has_ty = 0;
+    ident_t id;
+    DWORD ty = 0, d = 0, gf = 0, has_ty = 0;
 
-    diag_inc(META_DIAG_TYHIT);           /* 诊断：结算 hook 命中           */
-    atk_obj = g_atk; g_atk = 0;          /* 取用并清零（不残留给下一次）   */
-    vic_obj = g_vic; g_vic = 0;
-    d_ctor  = g_d;   g_d   = 0;
-    gf      = g_gf;  g_gf  = 0;
-    if (!atk_obj || !vic_obj) {          /* 无前置 ctor：本次不发布       */
-        diag_inc(META_DIAG_NOPD);
+    diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中               */
+
+    id = g_id;                           /* 取用即清零，不残留给下一次     */
+    g_id.ai = g_id.ag = g_id.vg = g_id.vi = 0;
+    if (!g_id_ok) {                      /* 无 hook1 身份：本次不发布     */
+        diag_inc(META_DIAG_NOPREV);
         return;
     }
+    g_id_ok = FALSE;
 
-    /* ① ty：唯一来源 = 游戏自身的 13 键重组器（纯读，无副作用）。
-     * ⚠ v10.31 曾在此退化读 arg0+0x1C —— 那是错的：arg0 是 CDamageHandle
-     *   （12 字节三元组：+0x0C 侧别标签 / +0x04 idA / +0x08 idB），不是
-     *   CDamageProperty；+0x1C 既越界也不含 ty。已删除，读不到即省略。 */
+    /* ty：游戏自身的 13 键 OR 重组器（纯读，无副作用） */
     if (handle && g_fn_ty_reasm) {
         ty = g_fn_ty_reasm((void *)handle, NULL);
         has_ty = 1;
     }
 
-    /* ② d：属性表里的伤害总量（DCC328，HP 结算实际扣血）；0 = 未设置 */
+    /* d：属性表里的伤害总量（DCC328 = HP 实际扣血）；0 = 本次未扣血 */
     if (handle && g_fn_get_prop)
-        d2 = g_fn_get_prop((void *)handle, NULL,
-                           (const void *)((const BYTE *)(UINT_PTR)g_base
-                                          + RVA_KEY_D2));
+        d = g_fn_get_prop((void *)handle, NULL,
+                          (const void *)((const BYTE *)(UINT_PTR)g_base
+                                         + RVA_KEY_D2));
+    if (!d) {
+        diag_or(META_DIAG_WHY, 1);
+        diag_inc(META_DIAG_DROP);
+        return;
+    }
+
+    /* gf：结算这一帧的 GameFrame（时间轴随发布时刻） */
+    safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
+    if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
 
     if (has_ty) diag_inc(META_DIAG_TYPAIR);
-    resolve_publish(gf, atk_obj, vic_obj, d_ctor, has_ty, ty, d2);
+    publish_event(gf, d, id.ai, id.ag, id.vg, id.vi, has_ty, ty);
 }
 
 __declspec(naked) static void hook_settle(void)
@@ -1115,7 +1027,7 @@ __declspec(naked) static void hook_settle(void)
 }
 
 /* 结算 hook 创建：同主 hook，只 Create 不 Enable。
- * v10.34 起没有备用发布路径，Create 失败 = DPS 通道整场关闭（游戏无感知），
+ * hook2 是唯一发布点，Create 失败 = DPS 通道整场关闭（游戏无感知），
  * 因此 DbgView 的 settle_hook= 是唯一现场判据。 */
 static BOOL create_hook_settle(void)
 {
@@ -1125,7 +1037,7 @@ static BOOL create_hook_settle(void)
         char msg[128];
         _snprintf(msg, sizeof msg - 1,
             "[dps] prologue mismatch @ RVA 0x%X (settle hook), exe updated? "
-            "hook skipped, ty/d2 disabled", HOOK_SETTLE_RVA);
+            "hook skipped, DPS channel disabled", HOOK_SETTLE_RVA);
         OutputDebugStringA(msg);
         return FALSE;
     }
@@ -1137,7 +1049,7 @@ static BOOL create_hook_settle(void)
  * MH_ApplyQueued —— 仅一次 Freeze（挂起全部线程 + ProcessThreadIPs 修 EIP
  * + 写补丁 + 恢复），替代原先每钩一次 MH_EnableHook 的两次 Freeze。
  *   - 双钩均已 Create：同批翻转，无「主生效/副未装」中间窗口；
- *   - 仅单钩 Create 成功：ALL_HOOKS 只含它 —— v10.34 起两者缺一即无数据；
+ *   - 仅单钩 Create 成功：ALL_HOOKS 只含它 —— 两者缺一即无数据；
  *   - ApplyQueued 部分失败（循环内首个 EnableHookLL 失败即返回，先前钩子
  *     可能已生效）：QueueDisableHook(MH_ALL_HOOKS) + ApplyQueued 全量回滚，
  *     保守回到无钩态 —— EnableHookLL 的现实失败源仅 VirtualProtect。
@@ -1192,8 +1104,8 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     g_hooked      = (BOOL)(c_main   && applied);
     g_hook_settle = (BOOL)(c_settle && applied);
 
-    /* v10.31：属性读取原语按序言校验后绑定；不符 → 该项降级（ty 直读 /
-     * d 用 ctor 侧值），绝不把漂移过的地址当函数调。 */
+    /* 属性读取原语按序言校验后绑定：不符则保持 NULL（ty 省略 / d 取不到
+     * 即丢弃该条），绝不把漂移过的地址当函数调。 */
     {
         const BYTE *hp = (const BYTE *)(UINT_PTR)g_base + RVA_GET_PROP;
         const BYTE *tp = (const BYTE *)(UINT_PTR)g_base + RVA_TY_REASM;
@@ -1207,13 +1119,13 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     if (g_meta) {
         DWORD flags = 4u;               /* bit2 SHM 就绪                  */
         if (g_hooked) flags |= 1u;      /* bit0 主 hook                   */
-        if (g_hook_settle) flags |= 2u;     /* bit1 settle hook（ty+d2）      */
+        if (g_hook_settle) flags |= 2u;     /* bit1 hook2（唯一发布点）       */
         g_meta[META_DIAG_FLAGS / 4] = flags;
     }
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.35 shm=%d main_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.36 shm=%d main_hook=%d(RVA 0x%X) "
             "settle_hook=%d(RVA 0x%X) ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hooked, HOOK_RVA,
             g_hook_settle, HOOK_SETTLE_RVA,
