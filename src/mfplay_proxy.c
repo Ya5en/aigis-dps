@@ -1,6 +1,6 @@
 /* ==========================================================================
  * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
- * 实现版本 v10.52）
+ * 实现版本 v10.53）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -125,6 +125,15 @@
  *   v10.43–v10.49 期间把 VERSION 从 1.4.1 连推到 1.4.6 属误用，已废止；下文
  *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
  *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
+ *
+ * v10.53（2026-11-27）：**载荷新增 ex 调试字**（用户令：以后调试信息都从
+ *   ex 输出）。位置固定在 d 之后、ty 之前 ⇒ 顺序 `gf,ai,ag,vi,vg,d,ex[,ty]`，
+ *   ty 仍恒末位（可选字段前缀稳定性不变）。ex 为 u32 位域：低 8 位 = why
+ *   原因位，[11:8] = ai 来源（0 无 / 1 导弹 owner / 2 句柄直取 / 3 邮箱门），
+ *   [15:12] = 邮箱相位（未取到 / 已归因 / 丢弃 / 门返 0 / 门返非玩家系 /
+ *   原语未就绪），[16] vg 真 gen、[17] vi 有效、[18] ty 存在、[19] node
+ *   命中，[31:24] = EX_VER(1)。**约定：后续调试维度只在此扩展位定义并递增
+ *   EX_VER，不再新增载荷字段。** diag_ver 13→14，rel 仍 1.2.0。
  *
  * v10.52（2026-11-27）：**载荷字段顺序互换 vi/vg**（用户令）。
  *   线路顺序由 vg,vi 改为 vi,vg，即 `gf,ai,ag,vi,vg,d[,ty]`；字段名、类型、
@@ -980,7 +989,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 13;        /* v10.52：vi/vg 顺序互换 */
+    g_meta[META_DIAG_VER / 4]  = 14;        /* v10.53：新增 ex 调试字  */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1065,18 +1074,37 @@ static void diag_or(DWORD off, LONG bits)
  * 该表不是判活门的输入源（门读 this+0x34 vector[0]），三场 KENT=0
  * 已证明此路不通。输入改由 52F900 入口钩采集，见 capture_infl()。 */
 
+/* ---------- ex 调试字（v10.53，载荷内唯一调试通道） ---------- */
+/* 约定：**以后所有调试信息都从 ex 出**，不再新增载荷字段，也不再新增
+ * META 计数（计数只作进程内累计，事件级归因一律走 ex）。
+ * 位布局（低 → 高）：
+ *   [7:0]   why 原因位：1 d==0 / 2 参数空 / 4 受击非敌 / 8 攻击未归因 /
+ *           16 攻击者未知 / 32 owner 非玩家系
+ *   [11:8]  ai 来源 src：0 无 / 1 Missile owner / 2 句柄直取 / 3 邮箱门
+ *   [15:12] 邮箱相位 mbx：0 未取到 / 1 取到并归因 / 2 取到但 ai 已有（丢弃）/
+ *           3 门返 0 / 4 门返非玩家系 / 5 原语或单例未就绪
+ *   [16]    vg 为真 gen（受击者句柄可用，非指针低位退化）
+ *   [17]    vi 有效（模式槽索引非 0）
+ *   [18]    ty 字段本次存在
+ *   [19]    node（伤害节点）已查到
+ *   [23:20] 保留（当前恒 0）
+ *   [31:24] ex 版本号（当前 1）；解析端先比版本，再解释低位
+ * 新增调试维度 = 在保留位里分配 + EX_VER 递增，**不改字段名、不改顺序**。 */
+#define EX_VER 1u
+
 /* 单条发布：has_ty 决定是否输出 ty 字段（缺省不输出）。
  * 载荷组装见下（v10.29：单一模板 + 语义顺序）。 */
 /* 载荷组装（v10.29：单一模板 + 语义顺序）。
  * 顺序契约（勿随意调整，变更属协议变更）：gf → ai,ag（攻击者）→ vi,vg
- * （受击方；v10.52 互换 vi/vg 位置）→ d（伤害）→ ty（可选结算标志，恒在末位）。理由：
+ * （受击方；v10.52 互换 vi/vg 位置）→ d（伤害）→ ex（调试字，v10.53）→
+ * ty（可选结算标志，恒在末位）。理由：
  *   ① 语义分组：时间 → 主体（攻→受）→ 结果数值 → 修饰标志；
  *   ② 可选字段固定末位 → 带/不带 ty 的事件共享稳定前缀，字节级 diff、
  *      前缀比对、未来定长二进制化均友好；
  *   ③ 单点组装：原双模板（带/不带 ty 各一份）已合并，增删字段只改这一处，
  *      杜绝"两份模板不同步"的协议漂移。 */
-static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
-                          DWORD vi, DWORD has_ty, DWORD ty)
+static void publish_event(DWORD gf, DWORD d, DWORD ex, DWORD ai, DWORD ag,
+                          DWORD vg, DWORD vi, DWORD has_ty, DWORD ty)
 {
     char  payload[160];
     char *w    = payload;
@@ -1085,11 +1113,12 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
 
     if (!g_shm) return;
 
-    /* 段 1：固定六字段（时间 + 主体对 + 伤害） */
+    /* 段 1：固定七字段（时间 + 主体对 + 伤害 + 调试字） */
     n = _snprintf(w, left, "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vi\":%lu,"
-                           "\"vg\":%lu,\"d\":%lu",
+                           "\"vg\":%lu,\"d\":%lu,\"ex\":%lu",
                   (unsigned long)gf, (unsigned long)ai, (unsigned long)ag,
-                  (unsigned long)vi, (unsigned long)vg, (unsigned long)d);
+                  (unsigned long)vi, (unsigned long)vg, (unsigned long)d,
+                  (unsigned long)ex);
     if (n <= 0 || n >= left) return;     /* 截断/负值：不发布半截数据 */
     w += n; left -= n;
 
@@ -1105,7 +1134,7 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
     *w++ = '}';
     *w   = '\0';
 
-    /* 上界 = 7 字段全取 u32 满值（~114B）；超 148B 只可能是格式化异常 */
+    /* 上界 = 8 字段全取 u32 满值（~124B）；超 148B 只可能是格式化异常 */
     if ((DWORD)(w - payload) > 148u) return;
     shm_publish(payload, (DWORD)(w - payload));
     diag_inc(META_DIAG_PUB);
@@ -1124,6 +1153,8 @@ static void report_settle(const void *handle, DWORD vic_obj)
     DWORD ai = 0, ag = 0, vg = 0, vi = 0;
     DWORD gid;
     LONG  why = 0;
+    /* v10.53 ex 调试字素材（见 EX 位布局） */
+    DWORD ex = 0, src = 0, mbx = 0, has_node = 0, zd = 0, vg_real = 0;
 
     diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中（= 发布条数） */
 
@@ -1144,6 +1175,7 @@ static void report_settle(const void *handle, DWORD vic_obj)
         } else {
             /* 受击方实例 gen：经 vt==1 过滤后必为 Enemy，恒有值 */
             vg = inst_id(vic_h, vic_obj);
+            if (vic_h) vg_real = 1;      /* 句柄可用 → vg 为真 gen      */
             /* 受击方种类键 vi：模式槽索引 = (pval − 0x200000) >> 4。
              * pval = *( *(vobj+4) + 5Ch )，落 .text 0x201250–0x2129E0
              * 模式代码区、16 字节对齐，右移 4 即槽号（与实机点阵逐一
@@ -1171,8 +1203,10 @@ static void report_settle(const void *handle, DWORD vic_obj)
         DWORD node = g_fn_lookup((void *)(UINT_PTR)g_mgr, NULL,
                                  (DWORD)(UINT_PTR)handle);
         DWORD atk_h = 0;
-        if (node)                        /* 攻击者句柄 = [node+0Ch]        */
+        if (node) {                      /* 攻击者句柄 = [node+0Ch]        */
+            has_node = 1;
             safe_read32((const BYTE *)(UINT_PTR)node + 0xC, &atk_h);
+        }
         if (!atk_h) {
             why |= 16;                   /* node 查无 / 句柄为 0           */
         } else {
@@ -1194,11 +1228,13 @@ static void report_settle(const void *handle, DWORD vic_obj)
                     } else {
                         ag = ow_h >> 16; /* owner 的真 gen                 */
                         ai = ocard;
+                        src = 1;         /* ex[11:8]：Missile owner        */
                     }
                 }
             } else if (at >= 3 && at <= 6) {
                 ag = atk_h >> 16;        /* 句柄直取，恒真 gen             */
                 ai = acard;
+                src = 2;                 /* ex[11:8]：句柄直取             */
             } else {
                 /* v10.51：能力实例反查（v10.43 的 C/D 两路）整体移除。
                  * 静态证明：r_ident = slot+4，r_ent = [r_ident+8]，与
@@ -1230,6 +1266,7 @@ static void report_settle(const void *handle, DWORD vic_obj)
                           (const void *)((const BYTE *)(UINT_PTR)g_base
                                          + RVA_KEY_D2));
     if (!d) {
+        zd = 1;                          /* ex[0]：d==0                   */
         diag_or(META_DIAG_WHY, 1);
         diag_inc(META_DIAG_ZEROD);       /* 质量计数，不是丢弃             */
     }
@@ -1247,20 +1284,24 @@ static void report_settle(const void *handle, DWORD vic_obj)
      * 采集点为游戏门内同源输入（同一 handler 内既喂门又造伤害节点），
      * 不再使用受击者 +0xEC 条目表（v10.46 押错的输入，已停用）。 */
     if (ai && gid) {
-        diag_inc(META_DIAG_GDISC);      /* 取到却用不上：邮箱溢出的可见信号 */
+        mbx = 2;                        /* 取到却用不上：邮箱溢出（ex[15:12]）*/
+        diag_inc(META_DIAG_GDISC);
     } else if (!ai) {
         if (!gid) {
-            diag_inc(META_DIAG_GEMPTY);      /* 邮箱空：本事件无同源输入 */
+            mbx = 0;                    /* 邮箱空：本事件无同源输入       */
+            diag_inc(META_DIAG_GEMPTY);
         } else {
             void *reg = entry_manager();
             if (!g_fn_reverse || !reg) {
-                diag_inc(META_DIAG_GNOREG);  /* 原语未绑 / 单例未构造   */
+                mbx = 5;                /* 原语未绑 / 单例未构造          */
+                diag_inc(META_DIAG_GNOREG);
             } else {
                 DWORD anc;
                 diag_inc(META_DIAG_KREVTRY);
                 anc = g_fn_reverse(reg, NULL, &gid);
                 if (!anc) {
-                    diag_inc(META_DIAG_KREVA0);  /* 判活门未通过         */
+                    mbx = 3;            /* 判活门未通过                   */
+                    diag_inc(META_DIAG_KREVA0);
                 } else {
                     DWORD t2 = 0, c2 = 0, h2 = 0;
                     void *o2 = NULL;
@@ -1269,18 +1310,31 @@ static void report_settle(const void *handle, DWORD vic_obj)
                         ai = c2;                  /* 施法者种类键        */
                         if (get_handle((void *)(UINT_PTR)anc, &h2) && h2)
                             ag = h2 >> 16;        /* 施法者真 gen        */
+                        src = 3;                  /* ex[11:8]：邮箱门    */
+                        mbx = 1;                  /* 取到并归因          */
                         diag_inc(META_DIAG_KREVOK);
                     } else {
-                        diag_inc(META_DIAG_KREVNP);  /* 非玩家系锚点    */
+                        mbx = 4;                  /* 门返非玩家系        */
+                        diag_inc(META_DIAG_KREVNP);
                     }
                 }
             }
         }
     }
 
+    /* ex 调试字：把所有归因/解析事实压进一个 u32（EX 位布局见上） */
+    ex = (((DWORD)why & 0xFFu) | zd)
+       | ((src  & 0xFu) << 8)
+       | ((mbx  & 0xFu) << 12)
+       | (vg_real ? (1u << 16) : 0u)
+       | (vi      ? (1u << 17) : 0u)
+       | (has_ty  ? (1u << 18) : 0u)
+       | (has_node? (1u << 19) : 0u)
+       | ((DWORD)EX_VER << 24);
+
     if (why) diag_or(META_DIAG_WHY, why);
     if (has_ty) diag_inc(META_DIAG_TYPAIR);
-    publish_event(gf, d, ai, ag, vg, vi, has_ty, ty);
+    publish_event(gf, d, ex, ai, ag, vg, vi, has_ty, ty);
 }
 
 __declspec(naked) static void hook_settle(void)
@@ -1462,7 +1516,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.52 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.53 shm=%d settle_hook=%d(RVA 0x%X) "
             "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
             "rev=%d(dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
