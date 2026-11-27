@@ -1,6 +1,6 @@
 /* ==========================================================================
  * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
- * 实现版本 v10.53）
+ * 实现版本 v10.54）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -34,8 +34,11 @@
  *     游戏进程 SEH 链被破坏，AV 不进 SEH 链）
  *   - resolve_handle（逆向自 sub_42DF80），升级为 1024 槽直接映射缓存
  *
- * 输出载荷（JSONL，七字段、ty 可缺省；顺序契约见 v10.29）：
- *   {"gf":20013,"ai":1469,"ag":3584,"vi":4761,"vg":4106,"d":7025,"ty":1}
+ * 输出载荷（JSONL，八字段全必现；顺序契约见 v10.29，v10.54 定序）：
+ *   {"gf":20013,"ai":1469,"ag":3584,"vi":4761,"vg":4106,"d":7025,
+ *    "ty":1,"ex":16842752}
+ *   ty 自 v10.54 起取消可选（原语不可用时以 0 占位，位置不变）；
+ *   ex 恒为末位字段（载荷内唯一调试通道）。
  *     gf = GameFrame（dword_F51838，暂停/倍速感知时钟）
  *     ai = 攻击者 CardID（导弹事件 = owner 的 CardID，[对象+44h]）
  *     ag = 攻击者实例标识 = 句柄高 16 位 gen（导弹事件 = owner 的 gen）
@@ -50,9 +53,9 @@
  *          → sub_4F1E50 13 键 OR 重组取得完整 dword（纯读无副作用）。
  *          位域 bit0~21：bit0=Magic、bit6=Critical、bit7=紫档基线等，
  *          详见 FINDINGS §44。
- *          发布只发生在结算 hook，无配对环节，因此「事件缺 ty」只有
- *          ty_src=0（sub_4F1E50 序言漂移）一种成因。
- *          **可选字段恒在末位**：带/不带 ty 的事件共享稳定前缀。
+ *          发布只发生在结算 hook，无配对环节；v10.54 起 ty 改为必现字段
+ *          （不再有「事件缺 ty」）：原语未绑或序言漂移时写 0 占位，
+ *          真伪由 ex[18]（ty 值有效）区分。
  *
  * 身份解析时机（v10.38）：全部在结算 hook（sub_5CAC50）内完成。攻击者经
  *   CDamageHandle* 查 node（sub_4F4B50）取 [node+0Ch] 句柄（与引擎
@@ -126,9 +129,20 @@
  *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
  *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
  *
+ * v10.54（2026-11-27）：**ty 取消可选 + ex 移到末位**（用户令）。
+ *   线路顺序定型为 `gf,ai,ag,vi,vg,d,ty,ex` —— 八字段全必现，无任何可选字段。
+ *   · ty：原语（sub_4F1E50）不可用时写 0 占位，位置恒在 d 之后；「带/不带
+ *     ty 两套前缀」的旧口径作废，reader 不必判缺。
+ *   · ex：从 d 后移到整条载荷最末，确保调试字永远不夹在业务字段之间；
+ *     将来扩调试维度只在位域内分配 + 递增 EX_VER，载荷顺序不再变动。
+ *   · publish_event 简化为单次格式化（原「段 1 + 可选段 2 + 闭合」三段
+ *     拼接合并），TYPAIR 计数口径改为「ty 值有效条数」，ex[18] 同义。
+ *   diag_ver 14→15，rel 仍 1.2.0。
+ *
  * v10.53（2026-11-27）：**载荷新增 ex 调试字**（用户令：以后调试信息都从
  *   ex 输出）。位置固定在 d 之后、ty 之前 ⇒ 顺序 `gf,ai,ag,vi,vg,d,ex[,ty]`，
- *   ty 仍恒末位（可选字段前缀稳定性不变）。ex 为 u32 位域：低 8 位 = why
+ *   ty 仍恒末位（**此定序已于 v10.54 失效：ty 必现、ex 移到末位**）。
+ *   ex 为 u32 位域：低 8 位 = why
  *   原因位，[11:8] = ai 来源（0 无 / 1 导弹 owner / 2 句柄直取 / 3 邮箱门），
  *   [15:12] = 邮箱相位（未取到 / 已归因 / 丢弃 / 门返 0 / 门返非玩家系 /
  *   原语未就绪），[16] vg 真 gen、[17] vi 有效、[18] ty 存在、[19] node
@@ -989,7 +1003,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 14;        /* v10.53：新增 ex 调试字  */
+    g_meta[META_DIAG_VER / 4]  = 15;        /* v10.54：ty 必现/ex 末位 */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1085,26 +1099,25 @@ static void diag_or(DWORD off, LONG bits)
  *           3 门返 0 / 4 门返非玩家系 / 5 原语或单例未就绪
  *   [16]    vg 为真 gen（受击者句柄可用，非指针低位退化）
  *   [17]    vi 有效（模式槽索引非 0）
- *   [18]    ty 字段本次存在
+ *   [18]    ty 值有效（原语已绑并取到；字段自 v10.54 起恒存在，此位只表值真伪）
  *   [19]    node（伤害节点）已查到
  *   [23:20] 保留（当前恒 0）
  *   [31:24] ex 版本号（当前 1）；解析端先比版本，再解释低位
  * 新增调试维度 = 在保留位里分配 + EX_VER 递增，**不改字段名、不改顺序**。 */
 #define EX_VER 1u
 
-/* 单条发布：has_ty 决定是否输出 ty 字段（缺省不输出）。
- * 载荷组装见下（v10.29：单一模板 + 语义顺序）。 */
-/* 载荷组装（v10.29：单一模板 + 语义顺序）。
+/* 载荷组装（v10.29 单一模板；v10.54：八字段全必现，ex 恒末位）。
  * 顺序契约（勿随意调整，变更属协议变更）：gf → ai,ag（攻击者）→ vi,vg
- * （受击方；v10.52 互换 vi/vg 位置）→ d（伤害）→ ex（调试字，v10.53）→
- * ty（可选结算标志，恒在末位）。理由：
- *   ① 语义分组：时间 → 主体（攻→受）→ 结果数值 → 修饰标志；
- *   ② 可选字段固定末位 → 带/不带 ty 的事件共享稳定前缀，字节级 diff、
- *      前缀比对、未来定长二进制化均友好；
- *   ③ 单点组装：原双模板（带/不带 ty 各一份）已合并，增删字段只改这一处，
- *      杜绝"两份模板不同步"的协议漂移。 */
-static void publish_event(DWORD gf, DWORD d, DWORD ex, DWORD ai, DWORD ag,
-                          DWORD vg, DWORD vi, DWORD has_ty, DWORD ty)
+ * （受击方，v10.52 互换）→ d（伤害）→ ty（结算标志）→ ex（调试字，末位）。
+ * 理由：
+ *   ① 语义分组：时间 → 主体（攻→受）→ 结果数值 → 修饰标志 → 调试；
+ *   ② **字段全必现**（v10.54 用户令：ty 不再可选）→ 载荷定长可比、前缀
+ *      稳定、reader 无需判缺；取不到的字段一律写 0 占位（不丢字段、不丢行）；
+ *   ③ **ex 恒为末位**：调试字不会插进业务字段中间；若将来再扩调试维度，
+ *      只在 ex 位域内分配（递增 EX_VER），载荷长度与顺序不变；
+ *   ④ 单点组装：增删字段只改这一处，杜绝"多份模板不同步"的协议漂移。 */
+static void publish_event(DWORD gf, DWORD d, DWORD ty, DWORD ex, DWORD ai,
+                          DWORD ag, DWORD vg, DWORD vi)
 {
     char  payload[160];
     char *w    = payload;
@@ -1113,26 +1126,13 @@ static void publish_event(DWORD gf, DWORD d, DWORD ex, DWORD ai, DWORD ag,
 
     if (!g_shm) return;
 
-    /* 段 1：固定七字段（时间 + 主体对 + 伤害 + 调试字） */
     n = _snprintf(w, left, "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vi\":%lu,"
-                           "\"vg\":%lu,\"d\":%lu,\"ex\":%lu",
+                           "\"vg\":%lu,\"d\":%lu,\"ty\":%lu,\"ex\":%lu}",
                   (unsigned long)gf, (unsigned long)ai, (unsigned long)ag,
                   (unsigned long)vi, (unsigned long)vg, (unsigned long)d,
-                  (unsigned long)ex);
+                  (unsigned long)ty, (unsigned long)ex);
     if (n <= 0 || n >= left) return;     /* 截断/负值：不发布半截数据 */
-    w += n; left -= n;
-
-    /* 段 2：可选 ty（末位，保证前缀稳定） */
-    if (has_ty) {
-        n = _snprintf(w, left, ",\"ty\":%lu", (unsigned long)ty);
-        if (n <= 0 || n >= left) return;
-        w += n; left -= n;
-    }
-
-    /* 段 3：闭合 */
-    if (left < 2) return;
-    *w++ = '}';
-    *w   = '\0';
+    w += n;
 
     /* 上界 = 8 字段全取 u32 满值（~124B）；超 148B 只可能是格式化异常 */
     if ((DWORD)(w - payload) > 148u) return;
@@ -1149,7 +1149,7 @@ static void publish_event(DWORD gf, DWORD d, DWORD ex, DWORD ai, DWORD ag,
 
 static void report_settle(const void *handle, DWORD vic_obj)
 {
-    DWORD ty = 0, d = 0, gf = 0, has_ty = 0;
+    DWORD ty = 0, d = 0, gf = 0, ty_ok = 0;
     DWORD ai = 0, ag = 0, vg = 0, vi = 0;
     DWORD gid;
     LONG  why = 0;
@@ -1256,7 +1256,7 @@ static void report_settle(const void *handle, DWORD vic_obj)
     /* ty：游戏自身的 13 键 OR 重组器（纯读，无副作用） */
     if (handle && g_fn_ty_reasm) {
         ty = g_fn_ty_reasm((void *)handle, NULL);
-        has_ty = 1;
+        ty_ok = 1;                        /* 值有效；字段恒存在（v10.54） */
     }
 
     /* d：属性表里的伤害总量（DCC328 = 伤害计算管线的最终值）。
@@ -1328,13 +1328,13 @@ static void report_settle(const void *handle, DWORD vic_obj)
        | ((mbx  & 0xFu) << 12)
        | (vg_real ? (1u << 16) : 0u)
        | (vi      ? (1u << 17) : 0u)
-       | (has_ty  ? (1u << 18) : 0u)
+       | (ty_ok   ? (1u << 18) : 0u)
        | (has_node? (1u << 19) : 0u)
        | ((DWORD)EX_VER << 24);
 
     if (why) diag_or(META_DIAG_WHY, why);
-    if (has_ty) diag_inc(META_DIAG_TYPAIR);
-    publish_event(gf, d, ex, ai, ag, vg, vi, has_ty, ty);
+    if (ty_ok) diag_inc(META_DIAG_TYPAIR);   /* 现口径：ty 值有效条数 */
+    publish_event(gf, d, ty, ex, ai, ag, vg, vi);
 }
 
 __declspec(naked) static void hook_settle(void)
@@ -1516,7 +1516,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.53 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.54 shm=%d settle_hook=%d(RVA 0x%X) "
             "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
             "rev=%d(dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
