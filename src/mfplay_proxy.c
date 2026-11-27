@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.0（PRD v1.7，实现版本 v10.38）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.1（PRD v1.7，实现版本 v10.43）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -100,6 +100,22 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.43（2026-11-27）：**能力实例归属反查上线**（SUB_5CBBE0_DECOMPILE
+ *   §13.11 全链，实现候选 A）。why|=8 分支（攻击者非玩家系/未知——快照
+ *   55 个 DOT 事件 ai=ag=0 的主因）接入游戏内建反查路径 sub_54BC00：
+ *     atk_h → F4CB70 槽 ident（slot+4，新增 resolve_ident：不做 +8 代理
+ *     重定向，ident+8 正是「目标实体」懒解析槽）→ ident+8 = attacker
+ *     实体 → RTTI 3..6 直取 / RTTI 未知（能力实例）→ [实例+0xC] 归属 id
+ *     （5687C0 注册时写入）→ 54BC00(dword_4F826E8, &id) 判活反查
+ *     （map find → gen 校验 → 死亡位过滤，5 层失败链 = 游戏自身 tick
+ *     门控）→ 锚点单位 → [锚点+0x44] = ai、锚点句柄>>16 = ag。
+ *   伤害正在结算 ⇒ 施法者判活链必通过（52F900 LABEL_41 逐 tick
+ *   54BC00(vector[0]) 走同一函数，施法者离场则 tick 根本不会发生）。
+ *   54BC00 绑定带序言校验（55 8B EC 56 FF 75 08，exe 实读）。
+ *   诊断：REVTRY/REVOK 0x64/0x68 + DbgView rev 样本行预算 200
+ *   （RPRT 0x6C）；失败细分 why bit64 = 反查推进到实体层仍未归因。
+ *   diag_ver 6→7。
  *
  * v10.42（2026-11-27）：修正 v10.41 遍历结构——快照实锤 key_ent 恒 0。
  *   依据 shm 快照 + sub_58A840/sub_4077C0 汇编逐条对照，四处偏差：
@@ -309,6 +325,19 @@ static const BYTE PROLOGUE_TY_REASM[3] = { 0x56, 0x57, 0x68 };
                                   * 管理器 → node 查找恒败 → ai/ag 全 0。     */
 static const BYTE PROLOGUE_NODE_LOOKUP[5] = { 0x55, 0x8B, 0xEC, 0x56, 0x57 };
 
+/* 归属反查原语（v10.43，SUB_5CBBE0_DECOMPILE §13.3/§13.11）：
+ * sub_54BC00(registry, &id) __thiscall —— registry map find → CEntry+4
+ * 句柄 → F4CB70/F4CB74 gen 校验 → slot+4 ident → ident+8 懒解析 →
+ * 死亡位 *( *(实体+4)+0x14 ) & 0x1000 过滤 → 返回归属锚点单位对象
+ * （任一层失败返 0，可当验活门）。registry 单例 = dword_4F826E8
+ * （CSimulatorPlayerEntryManager，408D20 惰性构建，战斗中必已存在；
+ * 54BC00 服务多种 registry，**必须选对单例**——§13.3 调用点①）。 */
+#define RVA_REVERSE   0x14BC00  /* sub_54BC00                            */
+#define RVA_REGMGR    0x4B826E8 /* dword_4F826E8 = VA 0x4F826E8−0x400000
+                                 * （7 位 VA 换算铁律，v10.40 教训）      */
+static const BYTE PROLOGUE_REVERSE[7] =
+    { 0x55, 0x8B, 0xEC, 0x56, 0xFF, 0x75, 0x08 };  /* exe 0x54BC00 实读 */
+
 /* GameFrame（dword_F51838，官方 API 注册于 sub_B1B0F0）：
  * 暂停/倍速/脚本变速全自动正确。RVA = VA 0xF51838 - 0x400000。 */
 #define RVA_GFRAME    0xB51838
@@ -324,9 +353,12 @@ typedef DWORD (__fastcall *fn_get_prop)(void *prop, void *unused_edx,
 typedef DWORD (__fastcall *fn_ty_reasm)(void *prop, void *unused_edx);
 typedef DWORD (__fastcall *fn_node_lookup)(void *mgr, void *unused_edx,
                                            DWORD handle);
+typedef DWORD (__fastcall *fn_reverse)(void *reg, void *unused_edx,
+                                       const DWORD *key);   /* 54BC00 */
 static fn_get_prop    g_fn_get_prop = NULL;
 static fn_ty_reasm    g_fn_ty_reasm = NULL;
 static fn_node_lookup g_fn_lookup   = NULL;
+static fn_reverse     g_fn_reverse  = NULL;  /* v10.43 归属反查       */
 static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
                                                 * v10.38 曾 init 读一次 → 恒 0）*/
 static BOOL        g_hook_settle = FALSE;   /* hook2（唯一 hook/发布点）    */
@@ -575,6 +607,32 @@ static void *resolve_handle(DWORD handle)
     return (void *)(UINT_PTR)obj;
 }
 
+/* v10.43：与 resolve_handle 同一张表，但**不做 [obj+8] 代理重定向**。
+ * ident 对象的 +8 正是「目标实体」懒解析槽（§13.11）——重定向会把
+ * ident/实体两种身份混在一个返回值里，归属反查需要原始 ident。
+ * 返回 slot+4（ident），gen 校验失败 / 槽空 → NULL。 */
+static void *resolve_ident(DWORD handle)
+{
+    WORD  idx = (WORD)(handle & 0xFFFF);
+    WORD  gen = (WORD)(handle >> 16);
+    DWORD tblBase = 0, stride = 0, obj = 0;
+
+    if (!handle) return NULL;
+    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_HBASE, &tblBase) ||
+        tblBase < 0x10000)
+        return NULL;
+    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_HSTRIDE, &stride))
+        return NULL;
+    if (stride < 4 || stride > 0x1000) return NULL;
+    {
+        BYTE *entry = (BYTE *)(UINT_PTR)tblBase + (DWORD)idx * stride;
+        DWORD g0 = 0;
+        if (!safe_read32(entry, &g0) || (WORD)g0 != gen) return NULL;
+        if (!safe_read32(entry + 4, &obj) || obj < 0x10000) return NULL;
+    }
+    return (void *)(UINT_PTR)obj;
+}
+
 /* GetHandle（sub_AAEFC0 语义，objdump 实锤）：
  *   p1 = [obj+04h] → p2 = [p1+34h] → 句柄 = [p2+0Ch]
  * ⚠ 引擎实现是**惰性创建**：p2+0Ch 为 0 时 `call [dword_F4CB5C]` 现场建句柄回写。
@@ -748,17 +806,20 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 /* 诊断区（reader 可忽略；写入方只有 DLL）。v10.38 起单 hook，零丢弃：
  * ty_hits == published 严格成立。旧配对期计数 0x18/0x1C/0x20
  * （ctor_hits/drop_count/no_prev）随 hook1 一并退役，恒 0、不再分配新含义。 */
-#define META_DIAG_VER   0x10u   /* 诊断块版本 = 4                         */
+#define META_DIAG_VER   0x10u   /* 诊断块版本（值见 shm_init 写入点）      */
 #define META_DIAG_FLAGS 0x14u   /* bit1 hook2 bit2 shm（bit0 曾为 hook1，废） */
 #define META_DIAG_TYHIT 0x24u   /* hook2 命中次数 = 发布条数              */
 #define META_DIAG_TYPAIR 0x28u  /* 带 ty 的发布次数                       */
 #define META_DIAG_PUB   0x2Cu   /* 实际发布条数（应恒 == ty_hits）        */
 #define META_DIAG_GF    0x30u   /* 最近一次发布的 gf                      */
 #define META_DIAG_WHY   0x34u   /* 观测位（不代表丢弃）：1 d==0 / 2 参数为空 /
-                                 * 4 受击者非敌方 / 8 攻击者非玩家系 /
+                                 * 4 受击者非敌方 / 8 攻击者未归因到玩家系 /
                                  * 16 攻击者句柄链解析失败（node 查找失败 /
                                  *   node+0Ch=0 / Missile owner 读失败） /
-                                 * 32 owner 非玩家系                       */
+                                 * 32 owner 非玩家系 /
+                                 * 64 v10.43 反查已推进到实体层但未归因
+                                 *   （含敌单位 / 锚点非玩家系；ident 缺失
+                                 *   或 ident+8 未回填时无此位）             */
 #define META_DIAG_ZEROD 0x38u   /* hook2 的 d==0 次数（仍发布，d 记 0）   */
 
 /* v10.41/v10.42 DOT key 诊断（纯观测，不参与发布载荷）。
@@ -774,6 +835,10 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_DIAG_KPRT   0x58u   /* keydiag DbgView 已打印行数（预算 200） */
 #define META_DIAG_KEV    0x5Cu   /* 有生效条目的 ai==0 事件数              */
 #define META_DIAG_KMULTI 0x60u   /* distinct key>1 或采样溢出的事件数      */
+#define META_DIAG_REVTRY 0x64u   /* v10.43 归属反查尝试次数（why|=8 分支） */
+#define META_DIAG_REVOK  0x68u   /* 反查成功归因次数（ai/ag 已回填）       */
+#define META_DIAG_RPRT   0x6Cu   /* rev DbgView 已打印行数（预算 200）     */
+#define REVERSE_PRINT_BUDGET 200u
 #define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
@@ -807,7 +872,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 6;         /* v10.42：遍历结构修正     */
+    g_meta[META_DIAG_VER / 4]  = 7;         /* v10.43：归属反查上线     */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1109,7 +1174,87 @@ static void report_settle(const void *handle, DWORD vic_obj)
                 ag = atk_h >> 16;        /* 句柄直取，恒真 gen             */
                 ai = acard;
             } else {
-                why |= 8;                /* 敌方 / 未知 / 解析失败         */
+                /* ---- v10.43 能力实例归属反查（§13.11 全链，候选 A）----
+                 * node+0xC = 攻击者引擎句柄（构造期快照，恒非 0）；
+                 * 未归类为 Missile/玩家系 → 本体是能力实例或敌单位。
+                 * 链：atk_h → ident(slot+4) → ident+8 = attacker 实体 →
+                 *   RTTI 3..6（单位，防御性直取）→ ai=[obj+0x44],
+                 *   ag=get_handle>>16；
+                 *   RTTI 未知（能力实例）→ [实例+0xC] 归属 id
+                 *   （5687C0 注册时写入）→ 54BC00(4F826E8,&id) 判活反查
+                 *   → 锚点单位 → ai=[锚点+0x44]、ag=锚点句柄>>16。
+                 * 伤害正在结算 ⇒ 游戏自身 tick 门控（52F900 逐 tick
+                 * 54BC00(vector[0])）保证判活链必通过。敌单位（et==1）
+                 * 维持 ai=0 不反查（语义与旧行为一致）。 */
+                DWORD rev_ok = 0, r_et = 0, r_anc = 0;
+                void *r_ident = NULL, *r_ent = NULL;
+                DWORD r_e8 = 0, r_own = 0;
+
+                diag_inc(META_DIAG_REVTRY);
+                r_ident = resolve_ident(atk_h);
+                if (r_ident &&
+                    safe_read32((const BYTE *)r_ident + 8, &r_e8) &&
+                    r_e8 >= 0x10000)
+                    r_ent = (void *)(UINT_PTR)r_e8;   /* 懒解析槽：目标实体 */
+                if (r_ent) {
+                    DWORD ecard = 0, eh = 0;
+                    void *eo = NULL;
+                    r_et = type_of_obj((DWORD)(UINT_PTR)r_ent, &eo, &ecard);
+                    if (r_et >= 3 && r_et <= 6) {
+                        ai = ecard;                   /* 单位本体直取       */
+                        if (get_handle(r_ent, &eh) && eh) ag = eh >> 16;
+                        rev_ok = 1;
+                    } else if (r_et == 0) {           /* 能力实例候选       */
+                        DWORD reg = 0;
+                        if (safe_read32((const BYTE *)r_ent + 0xC, &r_own)
+                            && r_own && g_fn_reverse &&
+                            safe_read32((const BYTE *)(UINT_PTR)g_base
+                                        + RVA_REGMGR, &reg) && reg) {
+                            r_anc = g_fn_reverse((void *)(UINT_PTR)reg,
+                                                 NULL, &r_own);
+                            if (r_anc) {
+                                DWORD ac2 = 0, ah = 0, at2;
+                                void *ao2 = NULL;
+                                at2 = type_of_obj(r_anc, &ao2, &ac2);
+                                if (at2 >= 3 && at2 <= 6) {
+                                    ai = ac2;
+                                    if (get_handle((void *)(UINT_PTR)r_anc,
+                                                   &ah) && ah)
+                                        ag = ah >> 16;
+                                    rev_ok = 1;
+                                }
+                            }
+                        }
+                    }
+                    /* r_et==1（敌单位）等：维持 ai=0，why|=8 旧行为 */
+                }
+                if (rev_ok) {
+                    diag_inc(META_DIAG_REVOK);
+                } else {
+                    why |= 8;             /* 未归因（与 v10.42 相同位）    */
+                    if (r_ent)
+                        why |= 64;        /* 反查已执行但 ident+8 链上
+                                             未归因（细分观测）            */
+                }
+                /* DbgView rev 样本行：预算 200 行，核对反查链各环节 */
+                if (g_meta
+                    && g_meta[META_DIAG_RPRT / 4] < REVERSE_PRINT_BUDGET) {
+                    char msg[224];
+                    diag_inc(META_DIAG_RPRT);
+                    _snprintf(msg, sizeof msg - 1,
+                        "[dps] rev atk_h=%lX idt=%lX ent=%lX "
+                        "et=%lu own=%lX anc=%lX ai=%lu ag=%lu ok=%d",
+                        (unsigned long)atk_h,
+                        (unsigned long)(UINT_PTR)r_ident,
+                        (unsigned long)(UINT_PTR)r_ent,
+                        (unsigned long)r_et,
+                        (unsigned long)r_own,
+                        (unsigned long)r_anc,
+                        (unsigned long)ai, (unsigned long)ag,
+                        (int)rev_ok);
+                    msg[sizeof msg - 1] = '\0';
+                    OutputDebugStringA(msg);
+                }
             }
         }
     } else {
@@ -1277,12 +1422,15 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
         const BYTE *hp = (const BYTE *)(UINT_PTR)g_base + RVA_GET_PROP;
         const BYTE *tp = (const BYTE *)(UINT_PTR)g_base + RVA_TY_REASM;
         const BYTE *np = (const BYTE *)(UINT_PTR)g_base + RVA_NODE_LOOKUP;
+        const BYTE *rp = (const BYTE *)(UINT_PTR)g_base + RVA_REVERSE;
         if (memcmp(hp, PROLOGUE_GET_PROP, sizeof PROLOGUE_GET_PROP) == 0)
             g_fn_get_prop = (fn_get_prop)hp;
         if (memcmp(tp, PROLOGUE_TY_REASM, sizeof PROLOGUE_TY_REASM) == 0)
             g_fn_ty_reasm = (fn_ty_reasm)tp;
         if (memcmp(np, PROLOGUE_NODE_LOOKUP, sizeof PROLOGUE_NODE_LOOKUP) == 0)
             g_fn_lookup = (fn_node_lookup)np;
+        if (memcmp(rp, PROLOGUE_REVERSE, sizeof PROLOGUE_REVERSE) == 0)
+            g_fn_reverse = (fn_reverse)rp;   /* v10.43 归属反查（54BC00） */
         /* g_mgr 不在 init 读：dword_4F82980 惰性创建，此时必为 0。
          * 每次结算时在 report_settle 内现读（v10.39）。 */
     }
@@ -1296,11 +1444,12 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.42 shm=%d settle_hook=%d(RVA 0x%X) "
-            "node_src=%d ty_src=%d d_src=%d base=0x%X",
+            "[dps] init: rel=%s impl=v10.43 shm=%d settle_hook=%d(RVA 0x%X) "
+            "node_src=%d ty_src=%d d_src=%d rev=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
-            g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0, (unsigned)g_base);
+            g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0,
+            g_fn_reverse ? 1 : 0, (unsigned)g_base);
         OutputDebugStringA(msg);
     }
 diag:
