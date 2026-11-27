@@ -1,5 +1,6 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.6（PRD v1.7，实现版本 v10.49）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
+ * 实现版本 v10.51）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -116,6 +117,27 @@
  *   新计数：GHIT(0x98) GID0(0x9C) GEMPTY(0xA0) GNOREG(0xA4) GDISC(0xA8)；
  *   KREV* (0x88–0x94) 语义改为「门输入 id 的调用/成功/返 0/非玩家系」。
  *   diag_ver 10→11；VERSION 1.4.5→1.4.6。
+ *
+ * v10.50（2026-11-27）：**版本号约定纠正**（用户令：重新确定语义化版本约定）。
+ *   semver 回退到与线上一致的 1.2.0 并冻结：**只有用户明确说「发布」时才动
+ *   VERSION**；任何自行推断的发布点（功能做完 / 实跑通过 / 准备部署）都不算。
+ *   每次改动只用内部 impl 版本区分，构建产物一律 rel=1.2.0 + impl 递增。
+ *   v10.43–v10.49 期间把 VERSION 从 1.4.1 连推到 1.4.6 属误用，已废止；下文
+ *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
+ *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
+ *
+ * v10.51（2026-11-27）：**删除能力实例反查 C/D 两路**（用户令：没生效就一并
+ *   移除）。静态定性（未用任何实测样本）：
+ *     r_ident = slot+4，r_ent = [r_ident+8]；而 resolve_handle 的返回值正是
+ *     slot→[+4]→[+8] 同一条链 ⇒ r_ent 与 resolve_cached 分类的对象**同一个**，
+ *     故 r_et ≡ at。该分支只在 at ∉ {2, 3..6}（即 at ∈ {0,1}）时进入：
+ *       · C「实体直取」要求 r_et ∈ 3..6 —— 与 at∈{0,1} 矛盾，**死代码**；
+ *       · D「能力实例归属」要求 at==0（RTTI 未知）后把 [ent+0xC] 当归属 id，
+ *         属未取证假设，且其门输入正是同一条死链。
+ *   删除：整个 else 分支、REV* 8 个计数（0x64–0x84）、DPS_REV 开关、
+ *   resolve_ident（仅 C/D 使用）、why 位 64。保留 g_fn_reverse / entry_manager
+ *   / PROLOGUE_REVERSE —— 52F900 邮箱路线（v10.49，ai==0 时唯一归因来源）
+ *   仍要用 54BC00 判活门。未归因事件回落 why|=8。diag_ver 11→12。
  *
  * v10.48（2026-11-27）：**判活门传参修正**（纯静态取证，未用任何实测样本）。
  *   v10.46 两处反查把 *(dword_4F826E8) 当 this 传给 54BC00 —— 该 dword 是
@@ -449,7 +471,6 @@ static fn_get_prop    g_fn_get_prop = NULL;
 static fn_ty_reasm    g_fn_ty_reasm = NULL;
 static fn_node_lookup g_fn_lookup   = NULL;
 static fn_reverse     g_fn_reverse  = NULL;  /* v10.43 归属反查       */
-static int         g_rev_enable = 1;        /* DPS_REV=0 关闭反查路径    */
 static int         g_dbg_print  = 0;        /* DPS_DBG=1 才开结算路径打印 */
 static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
                                                 * v10.38 曾 init 读一次 → 恒 0）*/
@@ -721,32 +742,6 @@ static void *resolve_handle(DWORD handle)
     return (void *)(UINT_PTR)obj;
 }
 
-/* v10.43：与 resolve_handle 同一张表，但**不做 [obj+8] 代理重定向**。
- * ident 对象的 +8 正是「目标实体」懒解析槽（§13.11）——重定向会把
- * ident/实体两种身份混在一个返回值里，归属反查需要原始 ident。
- * 返回 slot+4（ident），gen 校验失败 / 槽空 → NULL。 */
-static void *resolve_ident(DWORD handle)
-{
-    WORD  idx = (WORD)(handle & 0xFFFF);
-    WORD  gen = (WORD)(handle >> 16);
-    DWORD tblBase = 0, stride = 0, obj = 0;
-
-    if (!handle) return NULL;
-    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_HBASE, &tblBase) ||
-        tblBase < 0x10000)
-        return NULL;
-    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_HSTRIDE, &stride))
-        return NULL;
-    if (stride < 4 || stride > 0x1000) return NULL;
-    {
-        BYTE *entry = (BYTE *)(UINT_PTR)tblBase + (DWORD)idx * stride;
-        DWORD g0 = 0;
-        if (!safe_read32(entry, &g0) || (WORD)g0 != gen) return NULL;
-        if (!safe_read32(entry + 4, &obj) || obj < 0x10000) return NULL;
-    }
-    return (void *)(UINT_PTR)obj;
-}
-
 /* GetHandle（sub_AAEFC0 语义，objdump 实锤）：
  *   p1 = [obj+04h] → p2 = [p1+34h] → 句柄 = [p2+0Ch]
  * ⚠ 引擎实现是**惰性创建**：p2+0Ch 为 0 时 `call [dword_F4CB5C]` 现场建句柄回写。
@@ -931,23 +926,12 @@ static DWORD inst_id(DWORD handle, DWORD obj)
                                  * 16 攻击者句柄链解析失败（node 查找失败 /
                                  *   node+0Ch=0 / Missile owner 读失败） /
                                  * 32 owner 非玩家系 /
-                                 * 64 v10.43 反查已推进到实体层但未归因
-                                 *   （含敌单位 / 锚点非玩家系；ident 缺失
-                                 *   或 ident+8 未回填时无此位）             */
+                                 * （位 64 随 v10.51 C/D 反查删除退役，不再置位）*/
 #define META_DIAG_ZEROD 0x38u   /* hook2 的 d==0 次数（仍发布，d 记 0）   */
 
 /* v10.49：受击者 +0xEC 遍历已删除，KENT/KUNIQ/KMIS4C/KMISSRC/KRES/KPRT/
  * KEV/KMULTI（0x3C/0x44/0x4C/0x50/0x54/0x58/0x5C/0x60）全部退役，恒 0。
  * 0x40/0x48 是 META 区 SEQ_TOTAL/OLDEST，任何时候都不得占用。 */
-#define META_DIAG_REVTRY 0x64u   /* v10.43 归属反查尝试次数（why|=8 分支） */
-#define META_DIAG_REVOK  0x68u   /* 反查成功归因次数（ai/ag 已回填）       */
-#define META_DIAG_RPRT   0x6Cu   /* rev DbgView 已打印行数（预算 200）     */
-#define META_DIAG_REVET1 0x70u   /* v10.44 阶段：ident+8 判为敌类(et==1)   */
-#define META_DIAG_REVON0 0x74u   /* 阶段：et==0 但 [+0xC] 归属 id 为 0     */
-#define META_DIAG_REVNRG 0x78u   /* 阶段：own!=0 但 registry 单例不可用    */
-#define META_DIAG_REVA0  0x7Cu   /* 阶段：54BC00 判活反查返回 0            */
-#define META_DIAG_REVANP 0x80u   /* 阶段：锚点实体非玩家系 RTTI            */
-#define META_DIAG_REVAT1 0x84u   /* 阶段：resolve_cached(atk_h) 本身==1    */
 #define META_DIAG_KREVTRY 0x88u  /* v10.49：门输入 id → 54BC00 尝试次数    */
 #define META_DIAG_KREVOK  0x8Cu  /* v10.49：判活门反查成功回填 ai/ag 次数  */
 #define META_DIAG_KREVA0  0x90u  /* v10.49：54BC00 返回 0（判活门未通过）  */
@@ -957,7 +941,6 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_DIAG_GEMPTY  0xA0u  /* v10.49：结算时邮箱为空（无同源输入）   */
 #define META_DIAG_GNOREG  0xA4u  /* v10.49：有 id 但原语未绑/单例未构造    */
 #define META_DIAG_GDISC   0xA8u  /* v10.49：取到 id 但 ai 已解析、丢弃  */
-#define REVERSE_PRINT_BUDGET 200u
 #define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
@@ -991,7 +974,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 11;        /* v10.49：52F900 输入采集 */
+    g_meta[META_DIAG_VER / 4]  = 12;        /* v10.51：C/D 反查移除   */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -999,15 +982,6 @@ static void shm_init(void)
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
     g_meta[META_DIAG_ZEROD / 4]= 0;
-    g_meta[META_DIAG_REVTRY/4] = 0;
-    g_meta[META_DIAG_REVOK /4] = 0;
-    g_meta[META_DIAG_RPRT /4]  = 0;
-    g_meta[META_DIAG_REVET1/4] = 0;
-    g_meta[META_DIAG_REVON0/4] = 0;
-    g_meta[META_DIAG_REVNRG/4] = 0;
-    g_meta[META_DIAG_REVA0/4]  = 0;
-    g_meta[META_DIAG_REVANP/4] = 0;
-    g_meta[META_DIAG_REVAT1/4] = 0;
     g_meta[META_DIAG_KREVTRY/4]= 0;
     g_meta[META_DIAG_KREVOK/4] = 0;
     g_meta[META_DIAG_KREVA0/4] = 0;
@@ -1220,101 +1194,17 @@ static void report_settle(const void *handle, DWORD vic_obj)
                 ag = atk_h >> 16;        /* 句柄直取，恒真 gen             */
                 ai = acard;
             } else {
-                /* ---- v10.43/44 能力实例归属反查（§13.11 全链，候选 A）----
-                 * node+0xC = 攻击者引擎句柄（构造期快照，恒非 0）；
-                 * 未归类为 Missile/玩家系 → 本体是能力实例或敌单位。
-                 * 链：atk_h → ident(slot+4) → ident+8 = attacker 实体 →
-                 *   RTTI 3..6（单位，防御性直取）→ ai=[obj+0x44],
-                 *   ag=get_handle>>16；
-                 *   RTTI 未知（能力实例）→ [实例+0xC] 归属 id
-                 *   （5687C0 注册时写入）→ 54BC00(4F826E8,&id) 判活反查
-                 *   → 锚点单位 → ai=[锚点+0x44]、ag=锚点句柄>>16。
-                 * ⚠ v10.43 实跑裁决（shm_20261127_103211）：ty=128（52F900
-                 *   LABEL_41）路径 284/284 次 ident+8 判为 Enemy@@（et==1）
-                 *   —— 该路径 node+0xC 的 ident+8 不是能力实例（疑似自节点
-                 *   /受击者句柄），反查链只适用于 5AA520 能力 DOT 路径候选；
-                 *   ty=128 的归因须走受击者 +0xEC key 表（keydiag 线）。
-                 *   et==1 维持 ai=0（REV_ET1 计数），54BC00 不执行。
-                 * DPS_REV=0 可整体关闭本分支（崩溃 A/B 分割）。 */
-                DWORD rev_ok = 0, r_et = 0, r_anc = 0;
-                void *r_ident = NULL, *r_ent = NULL;
-                DWORD r_e8 = 0, r_own = 0;
-
-                {
-                    void *d_obj = NULL;          /* resolve_cached 出参不容
-                                                    NULL——哑变量接住（命中
-                                                    缓存，无额外开销）      */
-                    DWORD d_card = 0;
-                    if (resolve_cached(atk_h, &d_obj, &d_card) == 1)
-                        diag_inc(META_DIAG_REVAT1);   /* 攻击者句柄=敌类 */
-                }
-                diag_inc(META_DIAG_REVTRY);
-                if (g_rev_enable) {
-                    r_ident = resolve_ident(atk_h);
-                    if (r_ident &&
-                        safe_read32((const BYTE *)r_ident + 8, &r_e8) &&
-                        r_e8 >= 0x10000)
-                        r_ent = (void *)(UINT_PTR)r_e8;   /* 懒解析槽     */
-                    if (r_ent) {
-                        DWORD ecard = 0, eh = 0;
-                        void *eo = NULL;
-                        r_et = type_of_obj((DWORD)(UINT_PTR)r_ent, &eo,
-                                           &ecard);
-                        if (r_et >= 3 && r_et <= 6) {
-                            ai = ecard;               /* 单位本体直取   */
-                            if (get_handle(r_ent, &eh) && eh) ag = eh >> 16;
-                            rev_ok = 1;
-                        } else if (r_et == 0) {       /* 能力实例候选   */
-                            void *reg = NULL;
-                            if (!safe_read32((const BYTE *)r_ent + 0xC,
-                                             &r_own) || !r_own) {
-                                diag_inc(META_DIAG_REVON0);
-                            } else if (!g_fn_reverse
-                                       || !(reg = entry_manager())) {
-                                diag_inc(META_DIAG_REVNRG);
-                            } else if (!(r_anc = g_fn_reverse(reg, NULL,
-                                                              &r_own))) {
-                                diag_inc(META_DIAG_REVA0);
-                            } else {
-                                DWORD ac2 = 0, ah = 0, at2;
-                                void *ao2 = NULL;
-                                at2 = type_of_obj(r_anc, &ao2, &ac2);
-                                if (at2 >= 3 && at2 <= 6) {
-                                    ai = ac2;
-                                    if (get_handle((void *)(UINT_PTR)r_anc,
-                                                   &ah) && ah)
-                                        ag = ah >> 16;
-                                    rev_ok = 1;
-                                } else {
-                                    diag_inc(META_DIAG_REVANP);
-                                }
-                            }
-                        } else if (r_et == 1) {
-                            diag_inc(META_DIAG_REVET1);
-                        }
-                        /* 其余 et：维持 ai=0，why|=8 旧行为 */
-                    }
-                }
-                if (rev_ok) {
-                    diag_inc(META_DIAG_REVOK);
-                } else {
-                    why |= 8;             /* 未归因（与 v10.42 相同位）    */
-                    if (r_ent)
-                        why |= 64;        /* 反查已执行但 ident+8 链上
-                                             未归因（细分观测）            */
-                }
-                /* ⚠⚠ 结算路径内禁止 OutputDebugStringA（v10.45 定案）——
-                 * dump 链实锤（Aigis_r.exe.18696.dmp）：
-                 *   report_settle → ODS(rev 行) → RaiseException(DBG_
-                 *   PRINTEXCEPTION_C 0x40010006，记录 @0x53e710 param1=rev
-                 *   缓冲 0x53efb8、长度 0x53=83 字符) → 分发期间游戏侧
-                 *   AIGIS+0x822b6f（游戏异常过滤器/保护壳，亦即自定义 dump
-                 *   写入方）调 RaiseFailFastException(FAST_FAIL_FATAL_APP_
-                 *   EXIT=0x15) → 0xC0000409 进程死亡，fail-fast 记录 inner
-                 *   链接的正是这条 ODS 异常。
-                 * v10.44 的 DPS_DBG 门控不彻底：门开了照样崩。诊断一律走
-                 * SHM 计数（REV_* 阶段落盘），样本明细由 reader 离线还原。 */
-
+                /* v10.51：能力实例反查（v10.43 的 C/D 两路）整体移除。
+                 * 静态证明：r_ident = slot+4，r_ent = [r_ident+8]，与
+                 * resolve_handle 的重定向目标**是同一个对象**，因此
+                 *   r_et ≡ at（resolve_cached 的分类结果）；
+                 * 而本分支只在 at ∉ {2,3..6}、即 at ∈ {0,1} 时进入：
+                 *   ·「实体直取（r_et 3..6）」恒不成立 —— 死代码；
+                 *   ·「能力实例归属（at==0）」把未知类对象的 +0xC 当
+                 *     归属 id，无任何静态取证支撑，且其输入正是死链。
+                 * 两路均不产出有效 ai，按用户令一并删除；未归因维持
+                 * v10.42 语义 why|=8，归因交给 52F900 邮箱路线（下方）。*/
+                why |= 8;
             }
         }
     } else {
@@ -1510,14 +1400,10 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
 
     g_base = (DWORD)(UINT_PTR)GetModuleHandleA(NULL);
 
-    /* v10.45 运行开关：
-     *  DPS_REV=0 → 关闭归属反查（崩溃 A/B 分割用；why|=8 行为回到 v10.42）
-     *  DPS_DBG   → v10.44 曾用它门控结算路径 ODS 打印；v10.45 打印块已整体
-     *              移除（ODS 异常在分发中被游戏侧 fail-fast，实测致命），
-     *              该开关仅剩 init 单行摘要仍读取（init 线程非结算路径） */
-    if (GetEnvironmentVariableA("DPS_REV", tmp, sizeof tmp) &&
-        lstrcmpA(tmp, "0") == 0)
-        g_rev_enable = 0;
+    /* v10.51 运行开关：DPS_REV 随 C/D 反查删除一并退役（已无路径可关）。
+     *  DPS_DBG → v10.44 曾用它门控结算路径 ODS 打印；v10.45 打印块已整体
+     *            移除（ODS 异常在分发中被游戏侧 fail-fast，实测致命），
+     *            该开关仅剩 init 单行摘要仍读取（init 线程非结算路径） */
     if (GetEnvironmentVariableA("DPS_DBG", tmp, sizeof tmp) &&
         lstrcmpA(tmp, "1") == 0)
         g_dbg_print = 1;
@@ -1570,14 +1456,14 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.49 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.51 shm=%d settle_hook=%d(RVA 0x%X) "
             "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
-            "rev=%d(rev_en=%d dbg=%d) base=0x%X",
+            "rev=%d(dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_hook_infl, HOOK_INFL_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
             g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0,
-            g_fn_reverse ? 1 : 0, g_rev_enable, g_dbg_print,
+            g_fn_reverse ? 1 : 0, g_dbg_print,
             (unsigned)g_base);
         OutputDebugStringA(msg);
     }
