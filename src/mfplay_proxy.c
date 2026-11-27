@@ -101,6 +101,15 @@
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
  *
+ * v10.45（2026-11-27）：**结算路径 ODS 禁令升级为整体移除**（v10.44 门控
+ *   不彻底）。崩溃场次（用户观察：第一次 DOT 伤害出现瞬间）实证：
+ *   rev 打印的 ODS 异常（0x40010006，param=rev 缓冲）正在分发时，游戏侧
+ *   AIGIS+0x822b6f 调 RaiseFailFastException(0x15=FATAL_APP_EXIT) 且
+ *   fail-fast 记录 inner=该 ODS 异常——游戏保护壳/过滤器把外来异常当致命。
+ *   快照场次（shm_20261127_103211，同 v10.43）200 次打印幸存 → 游戏反应
+ *   是条件性的（保护壳状态/调试器在场），但触发器唯一：ODS 异常本身。
+ *   rev/keydiag 两处打印块删除；诊断一律走 SHM。VERSION 1.4.2→1.4.3。
+ *
  * v10.44（2026-11-27）：**崩溃修复 + 反查阶段落盘**（dump 实锤两发现）。
  *   ① 崩溃根因（Aigis_r.exe.18696.dmp，0xC0000409 fail-fast）：结算路径内
  *     OutputDebugStringA 的 DBG_PRINTEXCEPTION_C 走 SEH 分发，游戏 SEH 链
@@ -1286,28 +1295,18 @@ static void report_settle(const void *handle, DWORD vic_obj)
                         why |= 64;        /* 反查已执行但 ident+8 链上
                                              未归因（细分观测）            */
                 }
-                /* DbgView rev 样本行：预算 200 行。
-                 * ⚠ v10.44 起默认关闭（DPS_DBG=1 才开）：结算路径内 ODS 的
-                 * DBG_PRINTEXCEPTION_C 走 SEH 分发，游戏 SEH 链损坏环境下
-                 * 实测触发 fail-fast 0xC0000409（dump 实锤在途记录）。 */
-                if (g_dbg_print && g_meta
-                    && g_meta[META_DIAG_RPRT / 4] < REVERSE_PRINT_BUDGET) {
-                    char msg[224];
-                    diag_inc(META_DIAG_RPRT);
-                    _snprintf(msg, sizeof msg - 1,
-                        "[dps] rev atk_h=%lX idt=%lX ent=%lX "
-                        "et=%lu own=%lX anc=%lX ai=%lu ag=%lu ok=%d",
-                        (unsigned long)atk_h,
-                        (unsigned long)(UINT_PTR)r_ident,
-                        (unsigned long)(UINT_PTR)r_ent,
-                        (unsigned long)r_et,
-                        (unsigned long)r_own,
-                        (unsigned long)r_anc,
-                        (unsigned long)ai, (unsigned long)ag,
-                        (int)rev_ok);
-                    msg[sizeof msg - 1] = '\0';
-                    OutputDebugStringA(msg);
-                }
+                /* ⚠⚠ 结算路径内禁止 OutputDebugStringA（v10.45 定案）——
+                 * dump 链实锤（Aigis_r.exe.18696.dmp）：
+                 *   report_settle → ODS(rev 行) → RaiseException(DBG_
+                 *   PRINTEXCEPTION_C 0x40010006，记录 @0x53e710 param1=rev
+                 *   缓冲 0x53efb8、长度 0x53=83 字符) → 分发期间游戏侧
+                 *   AIGIS+0x822b6f（游戏异常过滤器/保护壳，亦即自定义 dump
+                 *   写入方）调 RaiseFailFastException(FAST_FAIL_FATAL_APP_
+                 *   EXIT=0x15) → 0xC0000409 进程死亡，fail-fast 记录 inner
+                 *   链接的正是这条 ODS 异常。
+                 * v10.44 的 DPS_DBG 门控不彻底：门开了照样崩。诊断一律走
+                 * SHM 计数（REV_* 阶段落盘），样本明细由 reader 离线还原。 */
+
             }
         }
     } else {
@@ -1353,28 +1352,9 @@ static void report_settle(const void *handle, DWORD vic_obj)
             else if (kd.nkeys > 1) diag_inc(META_DIAG_KMULTI);
             kd_t = resolve_cached(kd.keys[0], &kd_obj, &kd_card);
             if (kd_t >= 3 && kd_t <= 6) diag_inc(META_DIAG_KRES);
-            /* DbgView 样本行：预算 200 行（防刷屏），读 meta 计数。
-             * v10.44 起默认关闭（DPS_DBG=1 才开）——同 rev 行理由。 */
-            if (g_dbg_print && g_meta
-                && g_meta[META_DIAG_KPRT / 4] < KEYDIAG_PRINT_BUDGET) {
-                char msg[224];
-                diag_inc(META_DIAG_KPRT);
-                _snprintf(msg, sizeof msg - 1,
-                    "[dps] keydiag gf=%lu ty=%lX t=%lu ent=%d nkey=%d "
-                    "k=%lX ai=%lu ag=%lu +4C=%lX src=%lX o=%lX "
-                    "m4c=%d msrc=%d",
-                    (unsigned long)gf, (unsigned long)ty, (unsigned long)kd_t,
-                    kd.nent, kd.nkeys,
-                    (unsigned long)kd.keys[0],
-                    (unsigned long)kd_card,          /* ai 候选 = CardID */
-                    (unsigned long)(kd.keys[0] >> 16), /* ag 候选 = gen */
-                    (unsigned long)kd.last_4c,
-                    (unsigned long)kd.last_src,
-                    (unsigned long)kd.last_outer,
-                    kd.m_4c, kd.m_src);
-                msg[sizeof msg - 1] = '\0';
-                OutputDebugStringA(msg);
-            }
+            /* v10.45：keydiag DbgView 打印整体移除——结算路径内 ODS 禁令
+             * 同 rev 行（dump 链实锤见上方注释）。样本数据 kd.* 结构已在
+             * 内存中，如需明细后续经 SHM 扩展槽离线导出，不再走 ODS。 */
         }
     }
 
@@ -1455,10 +1435,11 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
 
     g_base = (DWORD)(UINT_PTR)GetModuleHandleA(NULL);
 
-    /* v10.44 运行开关：
+    /* v10.45 运行开关：
      *  DPS_REV=0 → 关闭归属反查（崩溃 A/B 分割用；why|=8 行为回到 v10.42）
-     *  DPS_DBG=1 → 才允许结算路径内 OutputDebugStringA 打印（v10.43 实测
-     *              在游戏的损坏 SEH 链上引发 fail-fast 0xC0000409，默认关）*/
+     *  DPS_DBG   → v10.44 曾用它门控结算路径 ODS 打印；v10.45 打印块已整体
+     *              移除（ODS 异常在分发中被游戏侧 fail-fast，实测致命），
+     *              该开关仅剩 init 单行摘要仍读取（init 线程非结算路径） */
     if (GetEnvironmentVariableA("DPS_REV", tmp, sizeof tmp) &&
         lstrcmpA(tmp, "0") == 0)
         g_rev_enable = 0;
