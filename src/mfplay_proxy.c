@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.4（PRD v1.7，实现版本 v10.46）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.5（PRD v1.7，实现版本 v10.48）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -100,6 +100,20 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.48（2026-11-27）：**判活门传参修正**（纯静态取证，未用任何实测样本）。
+ *   v10.46 两处反查把 *(dword_4F826E8) 当 this 传给 54BC00 —— 该 dword 是
+ *   静态对象本体，其内容为 vptr（??_7CSimulatorPlayerEntryManager 0xDD48E0）。
+ *   门内 lea esi,[ecx+4] 后 41D540 以 [ecx] 为 map head，vptr 传入会使
+ *   head=[0xDD48E4]=0x405B60（nullsub_1 代码地址），再取 [0x405B60+4] 的
+ *   代码字节当根节点解引用 → 游戏线程 AV（不在本站探针窗口内）。
+ *   静态证据：① 构造处 mov dword_4F826E8, offset vftable；② 全部调用点为
+ *   mov ecx, offset dword_4F826E8 或 sub_408D20 返回该 offset；③ 41D540
+ *   首指令 mov esi,[ecx]。
+ *   ⇒ 新增 entry_manager()：读 vptr 仅作「已构造」判据，返回对象**地址**。
+ *   行为未变的仍是输入源：id 取自受击者 +0xEC 条目，与 52F900 门内输入
+ *   （this+0x34 vector[0]）不同源，命中率须待换源后才能评估。
+ *   diag_ver 9→10；VERSION 1.4.4→1.4.5。
  *
  * v10.46（2026-11-27）：**判活门本体反查回填**（用户令：不做其他工作，
  *   只顺着游戏内判活门本体路径获取 ai/ag）。keydiag 由纯观测升级为归因：
@@ -370,7 +384,14 @@ static const BYTE PROLOGUE_NODE_LOOKUP[5] = { 0x55, 0x8B, 0xEC, 0x56, 0x57 };
  * 54BC00 服务多种 registry，**必须选对单例**——§13.3 调用点①）。 */
 #define RVA_REVERSE   0x14BC00  /* sub_54BC00                            */
 #define RVA_REGMGR    0x4B826E8 /* dword_4F826E8 = VA 0x4F826E8−0x400000
-                                 * （7 位 VA 换算铁律，v10.40 教训）      */
+                                 * （7 位 VA 换算铁律，v10.40 教训）
+                                 * ⚠ 该地址是**静态对象本体**（首 dword =
+                                 * vptr ??_7CSimulatorPlayerEntryManager），
+                                 * 不是「存放对象指针的变量」。传给 54BC00
+                                 * 的 ecx 必须是 g_base+RVA_REGMGR 这个地址
+                                 * 本身（游戏调用点 sub_408D20 返回的正是
+                                 * offset dword_4F826E8）。v10.46 传了
+                                 * *(该地址)=vptr，v10.48 修正。          */
 static const BYTE PROLOGUE_REVERSE[7] =
     { 0x55, 0x8B, 0xEC, 0x56, 0xFF, 0x75, 0x08 };  /* exe 0x54BC00 实读 */
 
@@ -560,6 +581,27 @@ static int safe_readN(const void *addr, BYTE *out, int len)
 {
     if (!page_readable(addr, len)) return 0;
     return probe_read(addr, out, len);
+}
+
+/* ------------------------------------------------------------------ */
+/* 判活门注册表单例地址（v10.48 修正）                                  */
+/*   dword_4F826E8（RVA 0x4B826E8）是**静态对象本体**，不是指针：       */
+/*     构造处：mov dword_4F826E8, offset ??_7CSimulatorPlayerEntry-     */
+/*             Manager@@6B@   ← 对象首 dword = vptr                     */
+/*     调用处：mov ecx, offset dword_4F826E8（或 sub_408D20 返回它）     */
+/*   54BC00 契约 ecx = 对象基址（56 字节内 lea esi,[ecx+4] 后 41D540     */
+/*   以 [ecx] 为 head）。因此**必须传地址**；把 *(该地址) 即 vptr 传进  */
+/*   去，会让 41D540 把 vtable slot1（0x405B60 nullsub_1 代码地址）当    */
+/*   map head，再取 [0x405B60+4] 的代码字节当根节点解引用 → 游戏线程    */
+/*   AV（不在本站探针窗口内，必崩）。                                   */
+/*   读值仅作「单例是否已构造」判据（vptr 非 0 ⇔ sub_408D20 已跑过）。  */
+/* ------------------------------------------------------------------ */
+static void *entry_manager(void)
+{
+    DWORD vt = 0;
+    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_REGMGR, &vt) || !vt)
+        return NULL;
+    return (void *)(UINT_PTR)(g_base + RVA_REGMGR);
 }
 
 /* 进程内 RTTI 类名解析：obj[0]=vftable -> vftable[-1]=COL(sig==0)
@@ -920,7 +962,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 9;         /* v10.46：判活门反查回填   */
+    g_meta[META_DIAG_VER / 4]  = 10;        /* v10.48：判活门传参修正   */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1271,18 +1313,15 @@ static void report_settle(const void *handle, DWORD vic_obj)
                             if (get_handle(r_ent, &eh) && eh) ag = eh >> 16;
                             rev_ok = 1;
                         } else if (r_et == 0) {       /* 能力实例候选   */
-                            DWORD reg = 0;
+                            void *reg = NULL;
                             if (!safe_read32((const BYTE *)r_ent + 0xC,
                                              &r_own) || !r_own) {
                                 diag_inc(META_DIAG_REVON0);
-                            } else if (!g_fn_reverse ||
-                                       !safe_read32(
-                                           (const BYTE *)(UINT_PTR)g_base
-                                           + RVA_REGMGR, &reg) || !reg) {
+                            } else if (!g_fn_reverse
+                                       || !(reg = entry_manager())) {
                                 diag_inc(META_DIAG_REVNRG);
-                            } else if (!(r_anc = g_fn_reverse(
-                                             (void *)(UINT_PTR)reg,
-                                             NULL, &r_own))) {
+                            } else if (!(r_anc = g_fn_reverse(reg, NULL,
+                                                              &r_own))) {
                                 diag_inc(META_DIAG_REVA0);
                             } else {
                                 DWORD ac2 = 0, ah = 0, at2;
@@ -1384,17 +1423,15 @@ static void report_settle(const void *handle, DWORD vic_obj)
             if (!g_fn_reverse) {
                 /* 原语未绑定：静默（why 已带 8）                          */
             } else {
-                DWORD reg = 0;
-                if (safe_read32((const BYTE *)(UINT_PTR)g_base
-                                + RVA_REGMGR, &reg) && reg) {
+                void *reg = entry_manager();   /* 对象地址；NULL=未构造    */
+                if (reg) {
                     DWORD cand[2] = {0, 0};
                     int   ncand = 0, ci;
                     if (kd.keys[0]) cand[ncand++] = kd.keys[0];
                     if (kd.last_4c && kd.last_4c != kd.keys[0])
                         cand[ncand++] = kd.last_4c;
                     for (ci = 0; ci < ncand && !ai; ci++) {
-                        DWORD anc = g_fn_reverse((void *)(UINT_PTR)reg, NULL,
-                                                 &cand[ci]);
+                        DWORD anc = g_fn_reverse(reg, NULL, &cand[ci]);
                         diag_inc(META_DIAG_KREVTRY);
                         if (!anc) {
                             diag_inc(META_DIAG_KREVA0);  /* 判活门未通过 */
@@ -1552,7 +1589,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.44 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.48 shm=%d settle_hook=%d(RVA 0x%X) "
             "node_src=%d ty_src=%d d_src=%d rev=%d(rev_en=%d dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
