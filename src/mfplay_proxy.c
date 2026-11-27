@@ -1,6 +1,6 @@
 /* ==========================================================================
  * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
- * 实现版本 v10.51）
+ * 实现版本 v10.52）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -35,7 +35,7 @@
  *   - resolve_handle（逆向自 sub_42DF80），升级为 1024 槽直接映射缓存
  *
  * 输出载荷（JSONL，七字段、ty 可缺省；顺序契约见 v10.29）：
- *   {"gf":20013,"ai":1469,"ag":3584,"vg":4106,"vi":4761,"d":7025,"ty":1}
+ *   {"gf":20013,"ai":1469,"ag":3584,"vi":4761,"vg":4106,"d":7025,"ty":1}
  *     gf = GameFrame（dword_F51838，暂停/倍速感知时钟）
  *     ai = 攻击者 CardID（导弹事件 = owner 的 CardID，[对象+44h]）
  *     ag = 攻击者实例标识 = 句柄高 16 位 gen（导弹事件 = owner 的 gen）
@@ -97,7 +97,7 @@
  * v10.29（2026-11-22）：载荷组装双模板合一 + 字段顺序按语义重排。
  *   原 gf,d[,ty],ai,ag,vg,vi 两份格式串（带/不带 ty 各一）→ 单点组装，
  *   增删字段只改一处（消灭"两模板不同步"的协议漂移风险）。新顺序契约：
- *   gf → ai,ag（攻击者）→ vg,vi（受击方）→ d（伤害）→ ty（可选，末位）。
+ *   gf → ai,ag（攻击者）→ vi,vg（受击方）→ d（伤害）→ ty（可选，末位）。
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
@@ -125,6 +125,12 @@
  *   v10.43–v10.49 期间把 VERSION 从 1.4.1 连推到 1.4.6 属误用，已废止；下文
  *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
  *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
+ *
+ * v10.52（2026-11-27）：**载荷字段顺序互换 vi/vg**（用户令）。
+ *   线路顺序由 vg,vi 改为 vi,vg，即 `gf,ai,ag,vi,vg,d[,ty]`；字段名、类型、
+ *   取值语义全部不变（JSON 对象无序，按名解析的 reader 零影响，只有字节序列
+ *   与前缀比对口径变化）。改动落点是 publish_event 里唯一那段格式化串与
+ *   实参顺序（v10.29 单点组装的直接收益）。diag_ver 12→13，rel 仍 1.2.0。
  *
  * v10.51（2026-11-27）：**删除能力实例反查 C/D 两路**（用户令：没生效就一并
  *   移除）。静态定性（未用任何实测样本）：
@@ -974,7 +980,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 12;        /* v10.51：C/D 反查移除   */
+    g_meta[META_DIAG_VER / 4]  = 13;        /* v10.52：vi/vg 顺序互换 */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1062,8 +1068,8 @@ static void diag_or(DWORD off, LONG bits)
 /* 单条发布：has_ty 决定是否输出 ty 字段（缺省不输出）。
  * 载荷组装见下（v10.29：单一模板 + 语义顺序）。 */
 /* 载荷组装（v10.29：单一模板 + 语义顺序）。
- * 顺序契约（勿随意调整，变更属协议变更）：gf → ai,ag（攻击者）→ vg,vi
- * （受击方）→ d（伤害）→ ty（可选结算标志，恒在末位）。理由：
+ * 顺序契约（勿随意调整，变更属协议变更）：gf → ai,ag（攻击者）→ vi,vg
+ * （受击方；v10.52 互换 vi/vg 位置）→ d（伤害）→ ty（可选结算标志，恒在末位）。理由：
  *   ① 语义分组：时间 → 主体（攻→受）→ 结果数值 → 修饰标志；
  *   ② 可选字段固定末位 → 带/不带 ty 的事件共享稳定前缀，字节级 diff、
  *      前缀比对、未来定长二进制化均友好；
@@ -1080,10 +1086,10 @@ static void publish_event(DWORD gf, DWORD d, DWORD ai, DWORD ag, DWORD vg,
     if (!g_shm) return;
 
     /* 段 1：固定六字段（时间 + 主体对 + 伤害） */
-    n = _snprintf(w, left, "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vg\":%lu,"
-                           "\"vi\":%lu,\"d\":%lu",
+    n = _snprintf(w, left, "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vi\":%lu,"
+                           "\"vg\":%lu,\"d\":%lu",
                   (unsigned long)gf, (unsigned long)ai, (unsigned long)ag,
-                  (unsigned long)vg, (unsigned long)vi, (unsigned long)d);
+                  (unsigned long)vi, (unsigned long)vg, (unsigned long)d);
     if (n <= 0 || n >= left) return;     /* 截断/负值：不发布半截数据 */
     w += n; left -= n;
 
@@ -1456,7 +1462,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.51 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.52 shm=%d settle_hook=%d(RVA 0x%X) "
             "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
             "rev=%d(dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
