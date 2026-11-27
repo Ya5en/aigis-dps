@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.5（PRD v1.7，实现版本 v10.48）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.6（PRD v1.7，实现版本 v10.49）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -100,6 +100,22 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.49（2026-11-27）：**归因输入源替换**（用户令：替换输入）。
+ *   v10.46/v10.48 的输入是受击者 +0xEC 条目表 key——那不是门的输入。
+ *   游戏内真正喂 54BC00 的是 sub_52F900（技能影响 tick，跳表 case 108）
+ *   里的 this+0x34 vector[0]：
+ *     v1 = a1[13]; v2 = (a1[14]-v1)>>2; v77 = v2 ? *v1 : 0;
+ *     sub_54BC00(registry, &v77);
+ *   汇编实锤 mov edx,[ebp+arg_0] / mov eax,[edx+38h] / mov ecx,[edx+34h]。
+ *   ⇒ 新增第二个钩子：52F900 入口（RVA 0x12F900，序言 55 8B EC 6A FF），
+ *     pushad 取唯一栈参 → capture_infl()：读 +0x34 → vector[0] → 邮箱。
+ *   邮箱语义 consume-once 且**每条结算无条件取走**（即使 ai 已由直取路线
+ *   解析）——残留 id 被下一条事件吃掉是最坏结果（错归属）。取不到只记
+ *   GEMPTY，维持 ai=0。删除 +0xEC 遍历（map_walk/keydiag 全段退役）。
+ *   新计数：GHIT(0x98) GID0(0x9C) GEMPTY(0xA0) GNOREG(0xA4) GDISC(0xA8)；
+ *   KREV* (0x88–0x94) 语义改为「门输入 id 的调用/成功/返 0/非玩家系」。
+ *   diag_ver 10→11；VERSION 1.4.5→1.4.6。
  *
  * v10.48（2026-11-27）：**判活门传参修正**（纯静态取证，未用任何实测样本）。
  *   v10.46 两处反查把 *(dword_4F826E8) 当 this 传给 54BC00 —— 该 dword 是
@@ -354,6 +370,20 @@
 static const BYTE EXPECT_PROLOGUE_SETTLE[HOOK_SETTLE_PATCH_LEN] =
         { 0x55, 0x8B, 0xEC, 0x83, 0xE4 };
 
+/* v10.49 输入采集钩：sub_52F900（技能影响 tick，跳表 case 108 → push 影响
+ * 对象 → call）。它是游戏里**唯一**把 this+0x34 vector[0] 喂给判活门的点：
+ *   v1 = a1[13];            // *(this+0x34) = vector begin
+ *   v2 = (a1[14]-v1) >> 2;  // end-begin / 4
+ *   v77 = v2 ? *v1 : 0;     // ← vector[0] = 施法者归属 id
+ *   sub_54BC00(registry_addr, &v77)
+ * 汇编实锤：mov edx,[ebp+arg_0] / mov eax,[edx+38h] / mov ecx,[edx+34h]。
+ * 调用约定：单栈参 stdcall（调用点 push esi; call，返回后无 add esp）。
+ * 序言 55 8B EC 6A FF 68（含 SEH 框架，MinHook 自行重定位）。 */
+#define HOOK_INFL_RVA       0x12F900
+#define HOOK_INFL_PATCH_LEN 5
+static const BYTE EXPECT_PROLOGUE_INFL[HOOK_INFL_PATCH_LEN] =
+        { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
+
 /* 属性读取原语：调用前二次校验序言，不符则该函数指针保持 NULL，绝不乱调。 */
 #define RVA_GET_PROP   0xF13B0   /* sub_4F13B0(prop,key) → u32，0 = 未设置 */
 #define RVA_TY_REASM   0xF1E50   /* sub_4F1E50(prop) → ty dword            */
@@ -401,6 +431,9 @@ static const BYTE PROLOGUE_REVERSE[7] =
 
 static DWORD       g_base    = 0;       /* 主模块基址（init 时取一次）    */
 static void       *g_tram_t  = NULL;    /* 结算 hook trampoline（保留旧名） */
+static void       *g_tram_infl = NULL;  /* v10.49 52F900 钩 trampoline    */
+static volatile LONG g_infl_id = 0;     /* v10.49 输入邮箱：vector[0] id
+                                         * 采集侧写、结算侧取走即清零     */
 
 /* 属性读取原语：init 时按序言校验后填充，NULL = 不可用（该字段随之缺省）。 */
 /* 目标函数均为 __thiscall（ecx = prop / mgr）。C 模式不支持 __thiscall 函数
@@ -420,7 +453,8 @@ static int         g_rev_enable = 1;        /* DPS_REV=0 关闭反查路径    *
 static int         g_dbg_print  = 0;        /* DPS_DBG=1 才开结算路径打印 */
 static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
                                                 * v10.38 曾 init 读一次 → 恒 0）*/
-static BOOL        g_hook_settle = FALSE;   /* hook2（唯一 hook/发布点）    */
+static BOOL        g_hook_settle = FALSE;   /* hook2（唯一发布点）          */
+static BOOL        g_hook_infl   = FALSE;   /* v10.49 输入采集钩            */
 
 /* ------------------------------------------------------------------ */
 /* 页级可读性预检（不触发异常、不走 SEH 分发）+ VEH 探针护盾            */
@@ -902,19 +936,9 @@ static DWORD inst_id(DWORD handle, DWORD obj)
                                  *   或 ident+8 未回填时无此位）             */
 #define META_DIAG_ZEROD 0x38u   /* hook2 的 d==0 次数（仍发布，d 记 0）   */
 
-/* v10.41/v10.42 DOT key 诊断（纯观测，不参与发布载荷）。
- * 口径：事件 = report_settle 中 ai==0 且受击者存在生效条目的一次结算；
- * 条目 = 受击者 +0xEC 外层 map → 内层 map 的树节点（条目字段相对节点，
- * 见 keydiag 块注释），生效判定 = node+0x24 &3==1（与 58A840 一致）。
- * 注意 0x40/0x48 是 META 区 SEQ_TOTAL/OLDEST，key 计数不得使用。 */
-#define META_DIAG_KENT   0x3Cu   /* 遍历到的生效条目总数                   */
-#define META_DIAG_KUNIQ  0x44u   /* distinct key 唯一的事件数（可归因候选）*/
-#define META_DIAG_KMIS4C 0x4Cu   /* key != node+0x4C 的条目次数            */
-#define META_DIAG_KMISSRC 0x50u  /* key != node+0x18 的条目次数（对照位）  */
-#define META_DIAG_KRES   0x54u   /* key resolve_cached 为玩家系(3..6)次数  */
-#define META_DIAG_KPRT   0x58u   /* keydiag DbgView 已打印行数（预算 200） */
-#define META_DIAG_KEV    0x5Cu   /* 有生效条目的 ai==0 事件数              */
-#define META_DIAG_KMULTI 0x60u   /* distinct key>1 或采样溢出的事件数      */
+/* v10.49：受击者 +0xEC 遍历已删除，KENT/KUNIQ/KMIS4C/KMISSRC/KRES/KPRT/
+ * KEV/KMULTI（0x3C/0x44/0x4C/0x50/0x54/0x58/0x5C/0x60）全部退役，恒 0。
+ * 0x40/0x48 是 META 区 SEQ_TOTAL/OLDEST，任何时候都不得占用。 */
 #define META_DIAG_REVTRY 0x64u   /* v10.43 归属反查尝试次数（why|=8 分支） */
 #define META_DIAG_REVOK  0x68u   /* 反查成功归因次数（ai/ag 已回填）       */
 #define META_DIAG_RPRT   0x6Cu   /* rev DbgView 已打印行数（预算 200）     */
@@ -924,10 +948,15 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_DIAG_REVA0  0x7Cu   /* 阶段：54BC00 判活反查返回 0            */
 #define META_DIAG_REVANP 0x80u   /* 阶段：锚点实体非玩家系 RTTI            */
 #define META_DIAG_REVAT1 0x84u   /* 阶段：resolve_cached(atk_h) 本身==1    */
-#define META_DIAG_KREVTRY 0x88u  /* v10.46：条目归属 id → 54BC00 尝试次数  */
-#define META_DIAG_KREVOK  0x8Cu  /* v10.46：判活门反查成功回填 ai/ag 次数  */
-#define META_DIAG_KREVA0  0x90u  /* v10.46：54BC00 返回 0（判活门未通过）  */
-#define META_DIAG_KREVNP  0x94u  /* v10.46：锚点单位非玩家系 RTTI          */
+#define META_DIAG_KREVTRY 0x88u  /* v10.49：门输入 id → 54BC00 尝试次数    */
+#define META_DIAG_KREVOK  0x8Cu  /* v10.49：判活门反查成功回填 ai/ag 次数  */
+#define META_DIAG_KREVA0  0x90u  /* v10.49：54BC00 返回 0（判活门未通过）  */
+#define META_DIAG_KREVNP  0x94u  /* v10.49：锚点单位非玩家系 RTTI          */
+#define META_DIAG_GHIT    0x98u  /* v10.49：52F900 采集钩命中次数          */
+#define META_DIAG_GID0    0x9Cu  /* v10.49：采集到空 vector / 首元素为 0   */
+#define META_DIAG_GEMPTY  0xA0u  /* v10.49：结算时邮箱为空（无同源输入）   */
+#define META_DIAG_GNOREG  0xA4u  /* v10.49：有 id 但原语未绑/单例未构造    */
+#define META_DIAG_GDISC   0xA8u  /* v10.49：取到 id 但 ai 已解析、丢弃  */
 #define REVERSE_PRINT_BUDGET 200u
 #define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
@@ -962,7 +991,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 10;        /* v10.48：判活门传参修正   */
+    g_meta[META_DIAG_VER / 4]  = 11;        /* v10.49：52F900 输入采集 */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -970,18 +999,24 @@ static void shm_init(void)
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
     g_meta[META_DIAG_ZEROD / 4]= 0;
-    g_meta[META_DIAG_KENT / 4] = 0;
-    g_meta[META_DIAG_KUNIQ/ 4] = 0;
-    g_meta[META_DIAG_KMIS4C/4] = 0;
-    g_meta[META_DIAG_KMISSRC/4]= 0;
-    g_meta[META_DIAG_KRES / 4] = 0;
-    g_meta[META_DIAG_KPRT / 4] = 0;
-    g_meta[META_DIAG_KEV / 4]  = 0;
-    g_meta[META_DIAG_KMULTI/4] = 0;
+    g_meta[META_DIAG_REVTRY/4] = 0;
+    g_meta[META_DIAG_REVOK /4] = 0;
+    g_meta[META_DIAG_RPRT /4]  = 0;
+    g_meta[META_DIAG_REVET1/4] = 0;
+    g_meta[META_DIAG_REVON0/4] = 0;
+    g_meta[META_DIAG_REVNRG/4] = 0;
+    g_meta[META_DIAG_REVA0/4]  = 0;
+    g_meta[META_DIAG_REVANP/4] = 0;
+    g_meta[META_DIAG_REVAT1/4] = 0;
     g_meta[META_DIAG_KREVTRY/4]= 0;
     g_meta[META_DIAG_KREVOK/4] = 0;
     g_meta[META_DIAG_KREVA0/4] = 0;
     g_meta[META_DIAG_KREVNP/4] = 0;
+    g_meta[META_DIAG_GHIT /4]  = 0;
+    g_meta[META_DIAG_GID0 /4]  = 0;
+    g_meta[META_DIAG_GEMPTY/4] = 0;
+    g_meta[META_DIAG_GNOREG/4] = 0;
+    g_meta[META_DIAG_GDISC /4]  = 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -1046,98 +1081,9 @@ static void diag_or(DWORD off, LONG bits)
 }
 
 /* ------------------------------------------------------------------ */
-/* v10.42 DOT key 诊断（修正 v10.41 的四处结构偏差）：                   */
-/*   受击者 +0xEC 条目表只读遍历。汇编实锤（sub_58A840 + sub_4077C0）：  */
-/*     MSVC map 节点：+0 _Left / +4 _Parent / +8 _Right /                */
-/*     +0xD _Isnil(byte) / +0x10 key / +0x14 value；                     */
-/*     root = head->_Parent（4077C0 从 head->_Parent 起二分）。          */
-/*   外层 map 对象在 vic+0xEC：key=效果类型(+0x10)，                     */
-/*     value(+0x14) = 内层头节点指针（58A840 v7=v6[5], v8=*v7）。        */
-/*   内层节点 = 条目本体（数据相对节点，58A840 esi 直读实锤）：          */
-/*     +0x24 生效标志(&3==1)、+0x3C 百分比、+0x40 固定值、               */
-/*     +0x4C 归因 id（case 2/9/12/16 构造 CAigisExpression 处）。        */
-/*   v10.41 偏差：root 取了 _Left、_Isnil 查了 +0xC、flag/+4C 多加了     */
-/*   +0x14 间接——导致 key_ent 恒 0。计数器 0x40/0x48 与 META 区          */
-/*   SEQ_TOTAL/OLDEST 撞位 → KEV/KMULTI 迁至 0x5C/0x60，diag_ver 5→6。   */
-/* ------------------------------------------------------------------ */
-
-typedef void (*fn_map_visit)(DWORD key, DWORD node, void *ctx);
-
-/* 中序遍历单节点（递归，深度 20 / 预算递减双护栏，全部 safe_read32） */
-static void map_walk_node(DWORD node, fn_map_visit fn, void *ctx,
-                          int depth, int *budget)
-{
-    DWORD l, r, nil, key;
-    if (!node || depth > 20 || *budget <= 0) return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)node, &l)) return;
-    map_walk_node(l, fn, ctx, depth + 1, budget);
-    if (*budget <= 0) return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)node + 0xC, &nil)
-        || ((nil >> 8) & 0xFFu))         /* _Isnil @ +0xD（byte1）       */
-        return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)node + 0x10, &key))
-        return;
-    (*budget)--;
-    fn(key, node, ctx);
-    if (!safe_read32((const BYTE *)(UINT_PTR)node + 8, &r)) return;
-    map_walk_node(r, fn, ctx, depth + 1, budget);
-}
-
-/* map 容器（首字段 = _Myhead）：root = head->_Parent */
-static void map_walk(DWORD map_base, fn_map_visit fn, void *ctx, int budget)
-{
-    DWORD head, root;
-    if (!map_base || budget <= 0) return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)map_base, &head) || !head)
-        return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)head + 4, &root)) return;
-    map_walk_node(root, fn, ctx, 0, &budget);
-}
-
-/* 内层：已持有头节点指针（= 外层 node+0x14 的值），不再解引用一次 */
-static void map_walk_head(DWORD head, fn_map_visit fn, void *ctx, int budget)
-{
-    DWORD root;
-    if (!head || budget <= 0) return;
-    if (!safe_read32((const BYTE *)(UINT_PTR)head + 4, &root)) return;
-    map_walk_node(root, fn, ctx, 0, &budget);
-}
-
-struct keydiag_ctx {
-    DWORD cur_outer;                    /* 外层 key（效果类型）         */
-    DWORD keys[8];                      /* distinct 生效 key 采样 ≤8    */
-    int   nkeys;
-    int   nent;                         /* 生效条目总数                 */
-    int   m_4c, m_src;                  /* key!=+4C / key!=+18h 计数    */
-    DWORD last_key, last_4c, last_src, last_outer;
-};
-
-static void keydiag_visit_inner(DWORD key, DWORD node, void *ctxp)
-{
-    struct keydiag_ctx *k = (struct keydiag_ctx *)ctxp;
-    DWORD flag = 0, f4c = 0, src = 0;
-    int  i;
-    if (!safe_read32((const BYTE *)(UINT_PTR)node + 0x24, &flag)) return;
-    if ((flag & 3u) != 1u) return;       /* 生效过滤，同 58A840          */
-    k->nent++;
-    diag_inc(META_DIAG_KENT);
-    safe_read32((const BYTE *)(UINT_PTR)node + 0x4C, &f4c);
-    safe_read32((const BYTE *)(UINT_PTR)node + 0x18, &src); /* 对照位   */
-    if (f4c != key) { k->m_4c++;  diag_inc(META_DIAG_KMIS4C);  }
-    if (src != key) { k->m_src++; diag_inc(META_DIAG_KMISSRC); }
-    for (i = 0; i < k->nkeys; i++)
-        if (k->keys[i] == key) break;
-    if (i == k->nkeys && k->nkeys < 8) k->keys[k->nkeys++] = key;
-    k->last_key = key; k->last_4c = f4c; k->last_src = src;
-    k->last_outer = k->cur_outer;
-}
-
-static void keydiag_visit_outer(DWORD key, DWORD val, void *ctxp)
-{
-    struct keydiag_ctx *k = (struct keydiag_ctx *)ctxp;
-    k->cur_outer = key;
-    map_walk_head(val, keydiag_visit_inner, ctxp, 64);
-}
+/* v10.42/keydiag 的受击者 +0xEC 条目遍历已于 v10.49 整体删除：
+ * 该表不是判活门的输入源（门读 this+0x34 vector[0]），三场 KENT=0
+ * 已证明此路不通。输入改由 52F900 入口钩采集，见 capture_infl()。 */
 
 /* 单条发布：has_ty 决定是否输出 ty 字段（缺省不输出）。
  * 载荷组装见下（v10.29：单一模板 + 语义顺序）。 */
@@ -1196,9 +1142,15 @@ static void report_settle(const void *handle, DWORD vic_obj)
 {
     DWORD ty = 0, d = 0, gf = 0, has_ty = 0;
     DWORD ai = 0, ag = 0, vg = 0, vi = 0;
+    DWORD gid;
     LONG  why = 0;
 
     diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中（= 发布条数） */
+
+    /* v10.49 输入邮箱：**每条结算无条件取走**（哪怕 ai 已由直取路线解析）。
+     * 只在 ai==0 时才消费的话，残留 id 会被下一条无关事件吃掉——错归属
+     * 比缺失更糟。取走后清零，绝不复用。 */
+    gid = (DWORD)InterlockedExchange(&g_infl_id, 0);
 
     /* ---------- 身份：受击者（vic_obj = ecx） ---------- */
     if (!vic_obj) {
@@ -1390,67 +1342,40 @@ static void report_settle(const void *handle, DWORD vic_obj)
     safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
     if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
 
-    /* ---------- v10.41 DOT key 诊断（纯观测，不改发布字段） ---------- */
-    /* 触发：ai==0（DOT 自节点 / 攻击者未归因到玩家系）且受击者对象在手。 */
-    if (!ai && vic_obj) {
-        static struct keydiag_ctx kd;
-        void  *kd_obj = NULL;
-        DWORD kd_card = 0, kd_t;
-        kd.nent = 0; kd.nkeys = 0;
-        kd.m_4c = 0; kd.m_src = 0;
-        kd.last_key = 0; kd.last_4c = 0; kd.last_src = 0;
-        kd.last_outer = 0; kd.cur_outer = 0;
-        map_walk((DWORD)(UINT_PTR)vic_obj + 0xEC,
-                 keydiag_visit_outer, &kd, 32);
-        if (kd.nent) {
-            diag_inc(META_DIAG_KEV);
-            if (kd.nkeys == 1)     diag_inc(META_DIAG_KUNIQ);
-            else if (kd.nkeys > 1) diag_inc(META_DIAG_KMULTI);
-            kd_t = resolve_cached(kd.keys[0], &kd_obj, &kd_card);
-            if (kd_t >= 3 && kd_t <= 6) diag_inc(META_DIAG_KRES);
-            /* v10.45：keydiag DbgView 打印整体移除——结算路径内 ODS 禁令
-             * 同 rev 行（dump 链实锤见上方注释）。样本数据 kd.* 结构已在
-             * 内存中，如需明细后续经 SHM 扩展槽离线导出，不再走 ODS。 */
-
-            /* ---- v10.46 判活门本体反查（唯一归因路径，用户令）----
-             * 游戏 DOT tick（52F900 LABEL_41）逐 tick 调 54BC00(条目内
-             * 施法者归属 id) 判活施法者——反查时伤害正在结算，该门必
-             * 通过（§13.9 用户断言机制本体）。hook 侧同源输入：受击者
-             * +0xEC 条目表条目的归属 id（内层 map key @条目+0x4C，
-             * v10.41 静态实锤）→ 54BC00(4F826E8,&id) → 施法者单位 →
-             * ai=[obj+0x44]、ag=get_handle>>16。键与 +0x4C 去重后各试
-             * 一次；键不唯一（nkeys>1）只取首个采样。 */
-            if (!g_fn_reverse) {
-                /* 原语未绑定：静默（why 已带 8）                          */
+    /* ---------- v10.49 归因输入：52F900 的 this+0x34 vector[0] ---------- */
+    /* 触发：ai 仍为 0（既非 Missile owner、也非直取单位、反查链亦未归因）。
+     * 此时取游戏自己喂给判活门的那个 id：采集钩在 sub_52F900 入口
+     * （跳表 case 108）把 *(this+0x34) 的 vector[0] 写进邮箱，此处
+     * consume-once 取走并清零——宁可无输入，也不把旧 id 归到新事件。
+     * 取到 → 54BC00(注册表**对象地址**, &id) → 施法者单位 → ai/ag。
+     * 采集点为游戏门内同源输入（同一 handler 内既喂门又造伤害节点），
+     * 不再使用受击者 +0xEC 条目表（v10.46 押错的输入，已停用）。 */
+    if (ai && gid) {
+        diag_inc(META_DIAG_GDISC);      /* 取到却用不上：邮箱溢出的可见信号 */
+    } else if (!ai) {
+        if (!gid) {
+            diag_inc(META_DIAG_GEMPTY);      /* 邮箱空：本事件无同源输入 */
+        } else {
+            void *reg = entry_manager();
+            if (!g_fn_reverse || !reg) {
+                diag_inc(META_DIAG_GNOREG);  /* 原语未绑 / 单例未构造   */
             } else {
-                void *reg = entry_manager();   /* 对象地址；NULL=未构造    */
-                if (reg) {
-                    DWORD cand[2] = {0, 0};
-                    int   ncand = 0, ci;
-                    if (kd.keys[0]) cand[ncand++] = kd.keys[0];
-                    if (kd.last_4c && kd.last_4c != kd.keys[0])
-                        cand[ncand++] = kd.last_4c;
-                    for (ci = 0; ci < ncand && !ai; ci++) {
-                        DWORD anc = g_fn_reverse(reg, NULL, &cand[ci]);
-                        diag_inc(META_DIAG_KREVTRY);
-                        if (!anc) {
-                            diag_inc(META_DIAG_KREVA0);  /* 判活门未通过 */
-                            continue;
-                        }
-                        {
-                            DWORD t2 = 0, c2 = 0, h2 = 0;
-                            void *o2 = NULL;
-                            t2 = type_of_obj(anc, &o2, &c2);
-                            if (t2 >= 3 && t2 <= 6) {
-                                ai = c2;                 /* 施法者种类键 */
-                                if (get_handle((void *)(UINT_PTR)anc, &h2)
-                                    && h2)
-                                    ag = h2 >> 16;       /* 施法者真 gen */
-                                diag_inc(META_DIAG_KREVOK);
-                            } else {
-                                diag_inc(META_DIAG_KREVNP);
-                            }
-                        }
+                DWORD anc;
+                diag_inc(META_DIAG_KREVTRY);
+                anc = g_fn_reverse(reg, NULL, &gid);
+                if (!anc) {
+                    diag_inc(META_DIAG_KREVA0);  /* 判活门未通过         */
+                } else {
+                    DWORD t2 = 0, c2 = 0, h2 = 0;
+                    void *o2 = NULL;
+                    t2 = type_of_obj(anc, &o2, &c2);
+                    if (t2 >= 3 && t2 <= 6) {
+                        ai = c2;                  /* 施法者种类键        */
+                        if (get_handle((void *)(UINT_PTR)anc, &h2) && h2)
+                            ag = h2 >> 16;        /* 施法者真 gen        */
+                        diag_inc(META_DIAG_KREVOK);
+                    } else {
+                        diag_inc(META_DIAG_KREVNP);  /* 非玩家系锚点    */
                     }
                 }
             }
@@ -1496,6 +1421,57 @@ static BOOL create_hook_settle(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* v10.49 输入采集：52F900 入口取 this+0x34 vector[0]                   */
+/*   采集侧只写邮箱；结算侧取走即清零（consume-once）——宁可无输入，     */
+/*   也不把旧 id 归到新事件上（错归属比缺失更糟）。                     */
+/* ------------------------------------------------------------------ */
+static void diag_inc(DWORD off);        /* 定义见诊断计数段            */
+
+static void capture_infl(DWORD obj)
+{
+    DWORD beg = 0, id = 0;
+
+    diag_inc(META_DIAG_GHIT);
+    if (!obj ||
+        !safe_read32((const BYTE *)(UINT_PTR)obj + 0x34, &beg) ||
+        beg < 0x10000 ||
+        !safe_read32((const BYTE *)(UINT_PTR)beg, &id) || !id) {
+        diag_inc(META_DIAG_GID0);       /* 空 vector / 首元素为 0      */
+        return;
+    }
+    InterlockedExchange(&g_infl_id, (LONG)id);
+}
+
+__declspec(naked) static void hook_infl(void)
+{
+    __asm {
+        pushad
+        mov     eax, [esp+36]           /* 唯一栈参 = 影响对象（stdcall）*/
+        push    eax
+        call    capture_infl
+        add     esp, 4
+        popad
+        jmp     [g_tram_infl]           /* 原 5 字节序言 + 回跳          */
+    }
+}
+
+/* 采集钩创建：失败不影响结算通道（只是 ai 少一条来源）。 */
+static BOOL create_hook_infl(void)
+{
+    BYTE *tgt = (BYTE *)(UINT_PTR)g_base + HOOK_INFL_RVA;
+
+    if (memcmp(tgt, EXPECT_PROLOGUE_INFL, HOOK_INFL_PATCH_LEN) != 0) {
+        char msg[128];
+        _snprintf(msg, sizeof msg - 1,
+            "[dps] prologue mismatch @ RVA 0x%X (infl hook), skipped",
+            HOOK_INFL_RVA);
+        OutputDebugStringA(msg);
+        return FALSE;
+    }
+    return MH_CreateHook(tgt, (void *)hook_infl, &g_tram_infl) == MH_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* 批量启用（v10.30）：一次 MH_QueueEnableHook(MH_ALL_HOOKS) +
  * MH_ApplyQueued —— 仅一次 Freeze（挂起全部线程 + ProcessThreadIPs 修 EIP
  * + 写补丁 + 恢复），替代原先每钩一次 MH_EnableHook 的两次 Freeze。
@@ -1526,7 +1502,7 @@ static BOOL apply_queued_enable(void)
 static DWORD WINAPI init_thread_proc(LPVOID arg)
 {
     char tmp[32];
-    BOOL c_settle, applied;              /* v10.38 单 hook：只剩结算钩      */
+    BOOL c_settle, c_infl, applied;      /* v10.49 结算钩 + 采集钩 */
 
     if (GetEnvironmentVariableA("DPS_ON", tmp, sizeof tmp) &&
         lstrcmpA(tmp, "0") == 0)
@@ -1555,11 +1531,15 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     if (MH_Initialize() != MH_OK)
         goto diag;                       /* 引擎初始化失败：hook 不装 */
 
-    /* v10.38 单 hook：Create（含序言校验，零补丁零生效）→ 单次 Queue+Apply。
-     * 启用最终态 = Create 结果 ∧ Apply 结果。 */
+    /* v10.38 结算钩 + v10.49 输入采集钩：各自 Create（含序言校验，零补丁
+     * 零生效）→ 单次 Queue+Apply（一次 Freeze 同时启用两者）。
+     * 启用最终态 = 结算 Create 结果 ∧ Apply 结果；采集钩失败只少一条 ai
+     * 来源，不关闭结算通道。 */
     c_settle = create_hook_settle();
+    c_infl   = c_settle ? create_hook_infl() : FALSE;
     applied  = c_settle ? apply_queued_enable() : FALSE;
     g_hook_settle = (BOOL)(c_settle && applied);
+    g_hook_infl   = (BOOL)(c_infl && applied);
 
     /* 原语按序言校验后绑定：不符则保持 NULL（ty 省略 / d 取不到写 0 /
      * 攻击者身份解析失败），绝不把漂移过的地址当函数调。 */
@@ -1583,15 +1563,18 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     /* 诊断：安装状态写入 SHM flags + DbgView 单行摘要（排查"无数据"用） */
     if (g_meta) {
         DWORD flags = 4u;               /* bit2 SHM 就绪                  */
-        if (g_hook_settle) flags |= 2u;     /* bit1 hook2（唯一 hook）        */
+        if (g_hook_settle) flags |= 2u;     /* bit1 结算钩（发布点）      */
+        if (g_hook_infl)   flags |= 8u;     /* bit3 输入采集钩            */
         g_meta[META_DIAG_FLAGS / 4] = flags;
     }
     {
-        char msg[192];
+        char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.48 shm=%d settle_hook=%d(RVA 0x%X) "
-            "node_src=%d ty_src=%d d_src=%d rev=%d(rev_en=%d dbg=%d) base=0x%X",
+            "[dps] init: rel=%s impl=v10.49 shm=%d settle_hook=%d(RVA 0x%X) "
+            "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
+            "rev=%d(rev_en=%d dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
+            g_hook_infl, HOOK_INFL_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
             g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0,
             g_fn_reverse ? 1 : 0, g_rev_enable, g_dbg_print,
