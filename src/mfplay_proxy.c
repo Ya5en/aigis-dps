@@ -1,6 +1,6 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
- * 实现版本 v10.56）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.3.0（用户令预更新；PRD v1.7，
+ * 实现版本 v10.61）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -36,12 +36,11 @@
  *
  * 输出载荷（JSONL，业务字段 + ex 对象全必现；顺序契约见 v10.29，v10.54 定序）：
  *   {"gf":20013,"ai":1469,"ag":3584,"vi":4761,"vg":4106,"d":7025,"ty":1,
- *    "ex":{"why":8,"src":0,"mbx":1,"gate":3,"gin":286331153,"gout":4194304,
- *          "grtt":3,"greg":129876456,"vg_ok":1,"vi_ok":1,"ty_ok":1,
- *          "nd_ok":1,"ver":3}}
+ *    "ex":{}}
  *   ty 自 v10.54 起取消可选（原语不可用时以 0 占位，位置不变）；
- *   ex 恒为末位字段且内部为具名字段对象（v10.55 具名化，v10.56 追加判活门
- *   调用/返回；载荷内唯一调试通道）。
+ *   ex 恒为末位字段：v10.55–v10.58 曾承载具名调试字段（门观测 / 攻击者槽
+ *   原值 / RTTI 分类 / 有效性位），v10.59 按用户令**整体清空为空对象** ——
+ *   字段名 `ex` 与末位顺序保留，内部不再有任何调试参数。
  *     gf = GameFrame（dword_F51838，暂停/倍速感知时钟）
  *     ai = 攻击者 CardID（导弹事件 = owner 的 CardID，[对象+44h]）
  *     ag = 攻击者实例标识 = 句柄高 16 位 gen（导弹事件 = owner 的 gen）
@@ -58,7 +57,8 @@
  *          详见 FINDINGS §44。
  *          发布只发生在结算 hook，无配对环节；v10.54 起 ty 改为必现字段
  *          （不再有「事件缺 ty」）：原语未绑或序言漂移时写 0 占位，
- *          真伪由 ex[18]（ty 值有效）区分。
+ *          真伪由 META TYPAIR 计数（ty 值有效条数）统计；v10.59 起不再
+ *          逐事件落盘（ex 恒为空对象）。
  *
  * 身份解析时机（v10.38）：全部在结算 hook（sub_5CAC50）内完成。攻击者经
  *   CDamageHandle* 查 node（sub_4F4B50）取 [node+0Ch] 句柄（与引擎
@@ -131,6 +131,79 @@
  *   v10.43–v10.49 期间把 VERSION 从 1.4.1 连推到 1.4.6 属误用，已废止；下文
  *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
  *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
+ *
+ * v10.61（2026-11-27）：**预更新 semver 到 1.3.0**（用户令：部署并预更新
+ *   语义化版本号为 1.3.0）。`VERSION` 1.2.0 → 1.3.0（MINOR：发布批次推进），
+ *   源码头 / README / SHM_PROTOCOL / PROJECT / PRD 的版本横幅同步；
+ *   init 摘要随构建脚本注入打印 `rel=1.3.0 impl=v10.61`。
+ *   **行为零变化**：hook 数（1）、载荷（`ex:{}`）、META 诊断、原语绑定、
+ *   diag_ver（19）全部不动。此前 v10.50 起的「冻结 1.2.0」约定由本次
+ *   用户明确指令解除；后续日常迭代仍只用 impl 递增，除非再次明确发版。
+ *
+ * v10.60（2026-11-27）：**hook 盘点 + 只写不读死代码清理**（用户令：查看
+ *   现在有几个 hook 在实际工作，移除死代码）。
+ *   ① 盘点结论：运行中**只有 1 个 hook** —— `sub_5CAC50` 结算钩（唯一发布点，
+ *      DbgView `settle_hook=1`、快照 FLAGS bit1 与 TYHIT>0 为现场判据）。
+ *      4F4B50 / 4F13B0 / 4F1E50 / F51838 是**直接调用或读全局**，不是 hook；
+ *      `probe_veh` 是异常处理器、`mfplay.dll` 6 个导出是 loader 转发，均非 hook。
+ *      52F900 采集钩（hook_infl）与 hook1(4F3FA0) 早在 v10.57 / v10.38 移除。
+ *   ② 删除只写不读的残留：`g_dbg_print`（DPS_DBG 读进来只为在 init 摘要里
+ *      打印它自己）、`g_veh`（VEH 句柄从不用于注销）、`g_shm_map`（映射句柄
+ *      从不用于 CloseHandle）、`KEYDIAG_PRINT_BUDGET`（定义后无人引用的死宏）。
+ *      **AddVectoredExceptionHandler / CreateFileMapping 调用本身保留** —— 它们
+ *      有副作用（护盾注册 / 映射创建），只去掉无用的返回值存储。
+ *   ③ 行为零变化：hook 数、载荷、META 诊断、原语绑定全部不动。
+ *
+ * v10.59（2026-11-27）：**移除全部 ex 调试参数 + 判活门指针溯源归档**
+ *   （用户令：记录发现结果，移除调试参数（ex 输出空结构）并编译）。
+ *   ① `ex` 字段名与末位顺序保留，值改为**空对象 `{}`**；`ex_fields`、
+ *      `EX_VER`、init 打印的 `ex_ver` 一并退役。归因逻辑（why / ai / ag /
+ *      vg / vi / d / ty 与 META 诊断计数）**逐字节不动**，只删掉仅供 ex
+ *      使用的局部变量 src / vg_real / has_node 与 9 个 ex 赋值。
+ *      diag_ver 保持 19（META 偏移表未变；工具的 diag_ver 告警口径不变）。
+ *   ② 本轮静态发现归档（详见工作区日志 §13.39）：判活门 54BC00 本身
+ *      **不持有任何指针**；输入键 `unit+0x0C` 由 5687C0 从 `*arg0` 幂等
+ *      写入，权威副本在 registry(0x4F826E8)+4 的 `std::map<DWORD, void*>`
+ *      节点 `+0x10`（key）/ `+0x14`（CEntry*，MSVC `_Tree_nod` 布局）；
+ *      CEntry+4 是压缩句柄，`[0xF4CB70]+idx*[0xF4CB74]` 定位槽，槽 +0
+ *      存 gen 字、+4 存容器对象，容器 +8 才是判活门返回的实体指针（+0
+ *      为 vtable，0 时懒解析回填）。因此影子判活只需前三步，且返回的
+ *      实体与伤害事件无直接关联 —— 唯一联系是那个 map 键。
+ *
+ * v10.58（2026-11-27）：**攻击者槽句柄拆高低位落盘**（用户令：将 ath 拆成
+ *   高位和低位观察一下）。
+ *   快照 shm_152548（v10.57 首份，diag_ver=18）实测：ath 81/81 全部非零且
+ *   at≠0 —— 攻击者槽是**合法压缩句柄**，`resolve_cached` 能正常展开；
+ *   导弹事件 ath=0x028x0045 解析为 Missile（slot 0x45/0x46 轮换、gen 递增），
+ *   DOT 事件 ath 恒 0x027D0040 解析为 Enemy（= 受击敌人自己）。
+ *   故"实例 id vs 压缩句柄混用"假设**排除**，why=8 的真因是 at=1(Enemy)
+ *   被"仅 3..6 才取 CardID"的保守分支拒绝。
+ *   ① ex 的 `ath`（u32）拆为 `al`（低 16 = 句柄表槽号）与 `ah`（高 16 = gen），
+ *      免去读快照时的心算；本地仍保留 ath 原值做解析。EX_VER 4→5。
+ *   ② diag_ver 18→19；载荷更短（约 220B 上界），业务前缀不变。
+ *   ③ 语义：al/ah 全 0 ⇔ 旧 ath==0（node 未查到 / 槽为空）；al/ah 非零而
+ *      at==0 ⇒ 句柄解析不出已知类型。
+ *
+ * v10.57（2026-11-27）：**移除死钩 + 攻击者槽原值落盘**（用户令：移除没有
+ *   实际用到的 hook，然后把 atk_h 原文落盘）。
+ *   ① 移除 hook_infl（RVA 0x12F900）：三场快照 GHIT=0 —— 该钩只覆盖
+ *      sub_532D10 的 233 分支跳表 case 108，而持续伤害走的是 sub_58A840
+ *      （单位效果条目逐帧 tick，宿主 = PlayerApproachUnit /
+ *      PlayerRemoteUnit），两条链无交集：钩子装成但永不进入。
+ *   ② 连带退役整条邮箱归因路线：g_infl_id 邮箱、capture_infl / hook_infl /
+ *      create_hook_infl、entry_manager、g_fn_reverse 及其原语绑定
+ *      （RVA_REVERSE / RVA_REGMGR / PROLOGUE_REVERSE）、fn_reverse、
+ *      KREVTRY/KREVOK/KREVA0/KREVNP（0x88–0x94）、
+ *      GHIT/GID0/GEMPTY/GNOREG/GDISC（0x98–0xA8）、flags bit3。
+ *      ai 来源收敛为 Missile owner（src=1）与句柄直取（src=2）。
+ *   ③ ex 去掉 gate/gin/gout/grtt/greg 与 mbx，新增：
+ *        ath = [node+0x0C] 原值（不做任何解释；0 = node 未查到 / 槽为空）
+ *        at  = resolve_cached(ath) 的 RTTI 分类 0..6
+ *      用途：判定该槽属于「实例 id（unit+0x0C，54BC00 的 map 键）」还是
+ *      「压缩句柄（AAEFC0 输出，低 16 = 槽号 / 高 16 = gen）」——两者编号
+ *      空间不同，混用即 ai=0。EX_VER 3→4，diag_ver 17→18，rel 仍 1.2.0。
+ *   ④ 判活门静态契约（54BC00 本体 / 5687C0 注册链 / 49F8C0 两处调用）留
+ *      在源码注释里备查，供后续新增采集点（sub_49FD40 或 0x58A870）使用。
  *
  * v10.56（2026-11-27）：**判活门（54BC00）的调用与返回纳入 ex**（用户令）。
  *   ex 追加 5 个字段，schema 版本 2→3：
@@ -447,19 +520,9 @@
 static const BYTE EXPECT_PROLOGUE_SETTLE[HOOK_SETTLE_PATCH_LEN] =
         { 0x55, 0x8B, 0xEC, 0x83, 0xE4 };
 
-/* v10.49 输入采集钩：sub_52F900（技能影响 tick，跳表 case 108 → push 影响
- * 对象 → call）。它是游戏里**唯一**把 this+0x34 vector[0] 喂给判活门的点：
- *   v1 = a1[13];            // *(this+0x34) = vector begin
- *   v2 = (a1[14]-v1) >> 2;  // end-begin / 4
- *   v77 = v2 ? *v1 : 0;     // ← vector[0] = 施法者归属 id
- *   sub_54BC00(registry_addr, &v77)
- * 汇编实锤：mov edx,[ebp+arg_0] / mov eax,[edx+38h] / mov ecx,[edx+34h]。
- * 调用约定：单栈参 stdcall（调用点 push esi; call，返回后无 add esp）。
- * 序言 55 8B EC 6A FF 68（含 SEH 框架，MinHook 自行重定位）。 */
-#define HOOK_INFL_RVA       0x12F900
-#define HOOK_INFL_PATCH_LEN 5
-static const BYTE EXPECT_PROLOGUE_INFL[HOOK_INFL_PATCH_LEN] =
-        { 0x55, 0x8B, 0xEC, 0x6A, 0xFF };
+/* v10.57：52F900 输入采集钩（HOOK_INFL_RVA / EXPECT_PROLOGUE_INFL）已移除。
+ * 实测三场 GHIT=0：该钩只覆盖 sub_532D10 的 233 分支跳表里 case 108，而
+ * DOT 走的是 sub_58A840 的效果条目 tick，两条链无交集 ⇒ 死钩。 */
 
 /* 属性读取原语：调用前二次校验序言，不符则该函数指针保持 NULL，绝不乱调。 */
 #define RVA_GET_PROP   0xF13B0   /* sub_4F13B0(prop,key) → u32，0 = 未设置 */
@@ -482,25 +545,17 @@ static const BYTE PROLOGUE_TY_REASM[3] = { 0x56, 0x57, 0x68 };
                                   * 管理器 → node 查找恒败 → ai/ag 全 0。     */
 static const BYTE PROLOGUE_NODE_LOOKUP[5] = { 0x55, 0x8B, 0xEC, 0x56, 0x57 };
 
-/* 归属反查原语（v10.43，SUB_5CBBE0_DECOMPILE §13.3/§13.11）：
- * sub_54BC00(registry, &id) __thiscall —— registry map find → CEntry+4
- * 句柄 → F4CB70/F4CB74 gen 校验 → slot+4 ident → ident+8 懒解析 →
- * 死亡位 *( *(实体+4)+0x14 ) & 0x1000 过滤 → 返回归属锚点单位对象
- * （任一层失败返 0，可当验活门）。registry 单例 = dword_4F826E8
- * （CSimulatorPlayerEntryManager，408D20 惰性构建，战斗中必已存在；
- * 54BC00 服务多种 registry，**必须选对单例**——§13.3 调用点①）。 */
-#define RVA_REVERSE   0x14BC00  /* sub_54BC00                            */
-#define RVA_REGMGR    0x4B826E8 /* dword_4F826E8 = VA 0x4F826E8−0x400000
-                                 * （7 位 VA 换算铁律，v10.40 教训）
-                                 * ⚠ 该地址是**静态对象本体**（首 dword =
-                                 * vptr ??_7CSimulatorPlayerEntryManager），
-                                 * 不是「存放对象指针的变量」。传给 54BC00
-                                 * 的 ecx 必须是 g_base+RVA_REGMGR 这个地址
-                                 * 本身（游戏调用点 sub_408D20 返回的正是
-                                 * offset dword_4F826E8）。v10.46 传了
-                                 * *(该地址)=vptr，v10.48 修正。          */
-static const BYTE PROLOGUE_REVERSE[7] =
-    { 0x55, 0x8B, 0xEC, 0x56, 0xFF, 0x75, 0x08 };  /* exe 0x54BC00 实读 */
+/* v10.57：54BC00 反查原语（RVA_REVERSE / RVA_REGMGR / PROLOGUE_REVERSE）
+ * 随 52F900 邮箱归因路线一并移除 —— 它只服务「把邮箱 id 送进判活门」这条
+ * 已废止的路径。判活门契约仍记在此备查（后续若要新增采集点用得上）：
+ *   sub_54BC00(registry, &id) __thiscall —— registry map find → CEntry+4
+ *   压缩句柄（低16=槽号 / 高16=gen）→ 0xF4CB70 + idx*0xF4CB74 gen 校验 →
+ *   [slot+4] → [+8] 懒解析实体 → 死亡位 *(*(entity+4)+0x14) & 0x1000。
+ *   registry = dword_4F826E8，ecx 必须传**对象地址**而非其内容 vptr
+ *   （v10.46 传 vptr 导致游戏线程 AV，v10.48 修正）。
+ *   入参 id = **owner 指针**（unit+0x0C，由 5687C0 从 *arg0 幂等写入，
+ *   作为 registry+4 的 map<u32, CEntry*> 键；非实例 id / 非 CardID），
+ *   与 [CEntry+4] 的压缩句柄**不是同一编号空间**，不可互换。 */
 
 /* GameFrame（dword_F51838，官方 API 注册于 sub_B1B0F0）：
  * 暂停/倍速/脚本变速全自动正确。RVA = VA 0xF51838 - 0x400000。 */
@@ -508,9 +563,6 @@ static const BYTE PROLOGUE_REVERSE[7] =
 
 static DWORD       g_base    = 0;       /* 主模块基址（init 时取一次）    */
 static void       *g_tram_t  = NULL;    /* 结算 hook trampoline（保留旧名） */
-static void       *g_tram_infl = NULL;  /* v10.49 52F900 钩 trampoline    */
-static volatile LONG g_infl_id = 0;     /* v10.49 输入邮箱：vector[0] id
-                                         * 采集侧写、结算侧取走即清零     */
 
 /* 属性读取原语：init 时按序言校验后填充，NULL = 不可用（该字段随之缺省）。 */
 /* 目标函数均为 __thiscall（ecx = prop / mgr）。C 模式不支持 __thiscall 函数
@@ -520,17 +572,12 @@ typedef DWORD (__fastcall *fn_get_prop)(void *prop, void *unused_edx,
 typedef DWORD (__fastcall *fn_ty_reasm)(void *prop, void *unused_edx);
 typedef DWORD (__fastcall *fn_node_lookup)(void *mgr, void *unused_edx,
                                            DWORD handle);
-typedef DWORD (__fastcall *fn_reverse)(void *reg, void *unused_edx,
-                                       const DWORD *key);   /* 54BC00 */
 static fn_get_prop    g_fn_get_prop = NULL;
 static fn_ty_reasm    g_fn_ty_reasm = NULL;
 static fn_node_lookup g_fn_lookup   = NULL;
-static fn_reverse     g_fn_reverse  = NULL;  /* v10.43 归属反查       */
-static int         g_dbg_print  = 0;        /* DPS_DBG=1 才开结算路径打印 */
 static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
                                                 * v10.38 曾 init 读一次 → 恒 0）*/
 static BOOL        g_hook_settle = FALSE;   /* hook2（唯一发布点）          */
-static BOOL        g_hook_infl   = FALSE;   /* v10.49 输入采集钩            */
 
 /* ------------------------------------------------------------------ */
 /* 页级可读性预检（不触发异常、不走 SEH 分发）+ VEH 探针护盾            */
@@ -568,7 +615,6 @@ static int page_readable(const void *addr, int len)
 }
 
 static DWORD g_tls_probe = TLS_OUT_OF_INDEXES;   /* 探针窗口标记槽      */
-static PVOID g_veh       = NULL;                 /* VEH 句柄            */
 
 __declspec(naked) static void probe_n_body(void)
 {
@@ -693,26 +739,6 @@ static int safe_readN(const void *addr, BYTE *out, int len)
     return probe_read(addr, out, len);
 }
 
-/* ------------------------------------------------------------------ */
-/* 判活门注册表单例地址（v10.48 修正）                                  */
-/*   dword_4F826E8（RVA 0x4B826E8）是**静态对象本体**，不是指针：       */
-/*     构造处：mov dword_4F826E8, offset ??_7CSimulatorPlayerEntry-     */
-/*             Manager@@6B@   ← 对象首 dword = vptr                     */
-/*     调用处：mov ecx, offset dword_4F826E8（或 sub_408D20 返回它）     */
-/*   54BC00 契约 ecx = 对象基址（56 字节内 lea esi,[ecx+4] 后 41D540     */
-/*   以 [ecx] 为 head）。因此**必须传地址**；把 *(该地址) 即 vptr 传进  */
-/*   去，会让 41D540 把 vtable slot1（0x405B60 nullsub_1 代码地址）当    */
-/*   map head，再取 [0x405B60+4] 的代码字节当根节点解引用 → 游戏线程    */
-/*   AV（不在本站探针窗口内，必崩）。                                   */
-/*   读值仅作「单例是否已构造」判据（vptr 非 0 ⇔ sub_408D20 已跑过）。  */
-/* ------------------------------------------------------------------ */
-static void *entry_manager(void)
-{
-    DWORD vt = 0;
-    if (!safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_REGMGR, &vt) || !vt)
-        return NULL;
-    return (void *)(UINT_PTR)(g_base + RVA_REGMGR);
-}
 
 /* 进程内 RTTI 类名解析：obj[0]=vftable -> vftable[-1]=COL(sig==0)
  * -> COL+12=pTypeDescriptor -> TD+8=".?AV..."。逐字节 probe 读
@@ -987,17 +1013,9 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 /* v10.49：受击者 +0xEC 遍历已删除，KENT/KUNIQ/KMIS4C/KMISSRC/KRES/KPRT/
  * KEV/KMULTI（0x3C/0x44/0x4C/0x50/0x54/0x58/0x5C/0x60）全部退役，恒 0。
  * 0x40/0x48 是 META 区 SEQ_TOTAL/OLDEST，任何时候都不得占用。 */
-#define META_DIAG_KREVTRY 0x88u  /* v10.49：门输入 id → 54BC00 尝试次数    */
-#define META_DIAG_KREVOK  0x8Cu  /* v10.49：判活门反查成功回填 ai/ag 次数  */
-#define META_DIAG_KREVA0  0x90u  /* v10.49：54BC00 返回 0（判活门未通过）  */
-#define META_DIAG_KREVNP  0x94u  /* v10.49：锚点单位非玩家系 RTTI          */
-#define META_DIAG_GHIT    0x98u  /* v10.49：52F900 采集钩命中次数          */
-#define META_DIAG_GID0    0x9Cu  /* v10.49：采集到空 vector / 首元素为 0   */
-#define META_DIAG_GEMPTY  0xA0u  /* v10.49：结算时邮箱为空（无同源输入）   */
-#define META_DIAG_GNOREG  0xA4u  /* v10.49：有 id 但原语未绑/单例未构造    */
-#define META_DIAG_GDISC   0xA8u  /* v10.49：取到 id 但 ai 已解析、丢弃  */
-#define KEYDIAG_PRINT_BUDGET 200u
-static HANDLE         g_shm_map  = NULL;
+/* v10.57：KREVTRY/KREVOK/KREVA0/KREVNP（0x88–0x94）与 GHIT/GID0/GEMPTY/
+ * GNOREG/GDISC（0x98–0xA8）全部退役，恒 0、不再写入 —— 它们只统计
+ * 52F900 采集钩与判活门邮箱路线的活动，该路线已随死钩一并移除。       */
 static BYTE          *g_shm      = NULL;    /* 映射基址 = 元数据区      */
 static volatile DWORD *g_meta     = NULL;
 static volatile BYTE  *g_head     = NULL;
@@ -1014,7 +1032,6 @@ static void shm_init(void)
     view = (BYTE *)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL);
     if (!view) { CloseHandle(h); return; }
 
-    g_shm_map = h;
     g_shm     = view;
     g_meta    = (volatile DWORD *)view;
     g_head    = view + OFF_HEAD;
@@ -1029,7 +1046,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 17;        /* v10.56：ex 加判活门观测  */
+    g_meta[META_DIAG_VER / 4]  = 19;        /* v10.58 起，META 表未变   */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1037,15 +1054,6 @@ static void shm_init(void)
     g_meta[META_DIAG_GF / 4]   = 0;
     g_meta[META_DIAG_WHY / 4]  = 0;
     g_meta[META_DIAG_ZEROD / 4]= 0;
-    g_meta[META_DIAG_KREVTRY/4]= 0;
-    g_meta[META_DIAG_KREVOK/4] = 0;
-    g_meta[META_DIAG_KREVA0/4] = 0;
-    g_meta[META_DIAG_KREVNP/4] = 0;
-    g_meta[META_DIAG_GHIT /4]  = 0;
-    g_meta[META_DIAG_GID0 /4]  = 0;
-    g_meta[META_DIAG_GEMPTY/4] = 0;
-    g_meta[META_DIAG_GNOREG/4] = 0;
-    g_meta[META_DIAG_GDISC /4]  = 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -1112,45 +1120,16 @@ static void diag_or(DWORD off, LONG bits)
 /* ------------------------------------------------------------------ */
 /* v10.42/keydiag 的受击者 +0xEC 条目遍历已于 v10.49 整体删除：
  * 该表不是判活门的输入源（门读 this+0x34 vector[0]），三场 KENT=0
- * 已证明此路不通。输入改由 52F900 入口钩采集，见 capture_infl()。 */
+ * 已证明此路不通。（v10.57 起 52F900 采集钩亦已移除，见文件上方说明。） */
 
-/* ---------- ex 调试对象（v10.55，载荷内唯一调试通道） ---------- */
-/* 约定：**以后所有调试信息都从 ex 出**，不再新增载荷字段，也不再新增
- * META 计数（计数只作进程内累计，事件级归因一律走 ex）。
- * v10.55 起 ex 改为**具名字段对象**（用户令：ex 内部也用字段做语义格式化）；
- * v10.56 追加判活门（54BC00）的调用入参与返回（用户令：判活函数的调用和
- * 返回也放进调试信息）。线路形态恒为：
- *   "ex":{"why":8,"src":0,"mbx":1,"gate":3,"gin":286331153,"gout":4194304,
- *         "grtt":3,"greg":129876456,"vg_ok":1,"vi_ok":1,"ty_ok":1,"nd_ok":1,
- *         "ver":3}
- * 字段全部必现（整数，无嵌套可选）：
- *   why    原因位（位集合，非枚举）：1 d==0 / 2 参数空 / 4 受击非敌 /
- *          8 攻击未归因 / 16 攻击者未知 / 32 owner 非玩家系
- *   src    ai 来源：0 无 / 1 Missile owner / 2 句柄直取 / 3 邮箱门（52F900）
- *   mbx    邮箱相位：0 未取到 / 1 取到并归因 / 2 取到但 ai 已有（丢弃）/
- *          3 门返 0 / 4 门返非玩家系 / 5 原语或单例未就绪
- *   gate   判活门调用状态（v10.56）：0 未调用 / 1 已调用（返回前异常态，
- *          正常不会出现）/ 2 调用并返回 0（未过门）/ 3 调用并返非 0（过门）
- *   gin    喂给门的输入 id（= 邮箱取到的 cand；十进制，阅读时按 hex 看）
- *   gout   门返回值（施法者对象指针低 32 位；0 = 返回 0）
- *   grtt   门返回对象的 RTTI 分类（type_of_obj：0..6；0 需配合 gate 区分
- *          「未调用/返 0」与「真实分类 0」）
- *   greg   调用时 ecx 传入的注册表对象地址（应恒 = base + RVA_REGMGR；
- *          用于现场核验传参契约，与服务端静态实锤对照）
- *   vg_ok  vg 为真 gen（受击者句柄可用，非指针低位退化）
- *   vi_ok  vi 有效（模式槽索引非 0）
- *   ty_ok  ty 值有效（字段恒存在；0 = 以 0 占位的无效值）
- *   nd_ok  伤害节点（node）已查到
- *   ver    ex schema 版本（当前 3）；解析端先比 ver，再解释其余字段
- * 新增调试维度 = 加字段 + ver 递增（**不改已有字段名/含义**）；ex 恒为载荷
- * 最末字段，扩张只影响尾部，业务前缀不受影响。 */
-#define EX_VER 3u
-
-typedef struct {
-    DWORD why, src, mbx;                /* 归因结论与邮箱相位            */
-    DWORD gate, gin, gout, grtt, greg;  /* v10.56 判活门调用/返回        */
-    DWORD vg_ok, vi_ok, ty_ok, nd_ok, ver;
-} ex_fields;
+/* ---------- ex 调试对象：v10.59 起为空对象 ---------- */
+/* v10.55–v10.58 的 ex 曾依次承载门观测（gate/gin/gout/grtt/greg）、
+ * 邮箱相位（mbx）、攻击者槽原值（ath → al/ah）、RTTI 分类（at）与
+ * 有效性位（vg_ok/vi_ok/ty_ok/nd_ok），EX_VER 最高 5、diag_ver 19。
+ * v10.59 按用户令整体清空：字段名与末位顺序不变，值恒为 `{}`；
+ * `ex_fields` / `EX_VER` / init 的 ex_ver 打印全部删除。历史快照的
+ * 这些字段由 tools/analyze_snapshot.py 的兼容分支继续判读，writer
+ * 不再产生任何事件级调试参数。 */
 
 /* 载荷组装（v10.29 单一模板；v10.54：八字段全必现，ex 恒末位）。
  * 顺序契约（勿随意调整，变更属协议变更）：gf → ai,ag（攻击者）→ vi,vg
@@ -1162,10 +1141,10 @@ typedef struct {
  *   ③ **ex 恒为末位**且内部具名（v10.55）：业务字段顺序完全不受调试扩张
  *      影响；ex 里加字段只改尾部，老 reader 忽略未知键即可；
  *   ④ 单点组装：增删字段只改这一处，杜绝"多份模板不同步"的协议漂移。 */
-static void publish_event(DWORD gf, DWORD d, DWORD ty, const ex_fields *ex,
+static void publish_event(DWORD gf, DWORD d, DWORD ty,
                           DWORD ai, DWORD ag, DWORD vg, DWORD vi)
 {
-    char  payload[320];
+    char  payload[128];
     char *w    = payload;
     int   left = (int)sizeof payload;
     int   n;
@@ -1174,27 +1153,16 @@ static void publish_event(DWORD gf, DWORD d, DWORD ty, const ex_fields *ex,
 
     n = _snprintf(w, left,
                   "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vi\":%lu,"
-                  "\"vg\":%lu,\"d\":%lu,\"ty\":%lu,"
-                  "\"ex\":{\"why\":%lu,\"src\":%lu,\"mbx\":%lu,"
-                  "\"gate\":%lu,\"gin\":%lu,\"gout\":%lu,\"grtt\":%lu,"
-                  "\"greg\":%lu,\"vg_ok\":%lu,\"vi_ok\":%lu,"
-                  "\"ty_ok\":%lu,\"nd_ok\":%lu,\"ver\":%lu}}",
+                  "\"vg\":%lu,\"d\":%lu,\"ty\":%lu,\"ex\":{}}",
                   (unsigned long)gf, (unsigned long)ai, (unsigned long)ag,
                   (unsigned long)vi, (unsigned long)vg, (unsigned long)d,
-                  (unsigned long)ty,
-                  (unsigned long)ex->why, (unsigned long)ex->src,
-                  (unsigned long)ex->mbx, (unsigned long)ex->gate,
-                  (unsigned long)ex->gin, (unsigned long)ex->gout,
-                  (unsigned long)ex->grtt, (unsigned long)ex->greg,
-                  (unsigned long)ex->vg_ok, (unsigned long)ex->vi_ok,
-                  (unsigned long)ex->ty_ok, (unsigned long)ex->nd_ok,
-                  (unsigned long)ex->ver);
+                  (unsigned long)ty);
     if (n <= 0 || n >= left) return;     /* 截断/负值：不发布半截数据 */
     w += n;
 
-    /* 上界 = 7 业务字段 + ex 全取 u32 满值（~261B）；超 288B 只可能是格式化
-     * 异常（新增 ex 字段后须同步抬高此界与 payload 容量）。 */
-    if ((DWORD)(w - payload) > 288u) return;
+    /* 上界 = 7 业务字段（各 ≤10 位十进制）+ "ex":{} ⇒ 最大 120B；
+     * 超 120B 只可能是格式化异常（v10.58 的 320B/288B 界随之收紧）。 */
+    if ((DWORD)(w - payload) > 120u) return;
     shm_publish(payload, (DWORD)(w - payload));
     diag_inc(META_DIAG_PUB);
 }
@@ -1210,20 +1178,12 @@ static void report_settle(const void *handle, DWORD vic_obj)
 {
     DWORD ty = 0, d = 0, gf = 0, ty_ok = 0;
     DWORD ai = 0, ag = 0, vg = 0, vi = 0;
-    DWORD gid;
     LONG  why = 0;
-    /* ex 调试对象素材（v10.55 起具名字段，见 ex_fields 定义） */
-    DWORD src = 0, mbx = 0, has_node = 0, zd = 0, vg_real = 0;
-    /* v10.56 判活门观测：调用状态 / 入参 id / 返回值 / 返回对象分类 / ecx */
-    DWORD gate = 0, gin = 0, gout = 0, grtt = 0, greg = 0;
-    ex_fields ex;
+    /* v10.59：ex 调试素材已清空；zd 仅供 META 诊断，at 供归因分支判定 */
+    DWORD zd = 0;
+    DWORD at = 0;                       /* resolve_cached 的 RTTI 分类 0..6 */
 
     diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中（= 发布条数） */
-
-    /* v10.49 输入邮箱：**每条结算无条件取走**（哪怕 ai 已由直取路线解析）。
-     * 只在 ai==0 时才消费的话，残留 id 会被下一条无关事件吃掉——错归属
-     * 比缺失更糟。取走后清零，绝不复用。 */
-    gid = (DWORD)InterlockedExchange(&g_infl_id, 0);
 
     /* ---------- 身份：受击者（vic_obj = ecx） ---------- */
     if (!vic_obj) {
@@ -1237,7 +1197,6 @@ static void report_settle(const void *handle, DWORD vic_obj)
         } else {
             /* 受击方实例 gen：经 vt==1 过滤后必为 Enemy，恒有值 */
             vg = inst_id(vic_h, vic_obj);
-            if (vic_h) vg_real = 1;      /* 句柄可用 → vg 为真 gen      */
             /* 受击方种类键 vi：模式槽索引 = (pval − 0x200000) >> 4。
              * pval = *( *(vobj+4) + 5Ch )，落 .text 0x201250–0x2129E0
              * 模式代码区、16 字节对齐，右移 4 即槽号（与实机点阵逐一
@@ -1265,16 +1224,14 @@ static void report_settle(const void *handle, DWORD vic_obj)
         DWORD node = g_fn_lookup((void *)(UINT_PTR)g_mgr, NULL,
                                  (DWORD)(UINT_PTR)handle);
         DWORD atk_h = 0;
-        if (node) {                      /* 攻击者句柄 = [node+0Ch]        */
-            has_node = 1;
+        if (node)                        /* 攻击者槽 = [node+0Ch]          */
             safe_read32((const BYTE *)(UINT_PTR)node + 0xC, &atk_h);
-        }
         if (!atk_h) {
             why |= 16;                   /* node 查无 / 句柄为 0           */
         } else {
             void *aobj = NULL;
             DWORD acard = 0;
-            DWORD at = resolve_cached(atk_h, &aobj, &acard);
+            at = resolve_cached(atk_h, &aobj, &acard);
             if (at == 2) {
                 /* Missile：owner 句柄 = [Missile+0x48]（ctor sub_442C40
                  * 实锤），导弹创建时即存在，与惰性缓存无关。 */
@@ -1290,13 +1247,11 @@ static void report_settle(const void *handle, DWORD vic_obj)
                     } else {
                         ag = ow_h >> 16; /* owner 的真 gen                 */
                         ai = ocard;
-                        src = 1;         /* ex[11:8]：Missile owner        */
                     }
                 }
             } else if (at >= 3 && at <= 6) {
                 ag = atk_h >> 16;        /* 句柄直取，恒真 gen             */
                 ai = acard;
-                src = 2;                 /* ex[11:8]：句柄直取             */
             } else {
                 /* v10.51：能力实例反查（v10.43 的 C/D 两路）整体移除。
                  * 静态证明：r_ident = slot+4，r_ent = [r_ident+8]，与
@@ -1337,79 +1292,12 @@ static void report_settle(const void *handle, DWORD vic_obj)
     safe_read32((const BYTE *)(UINT_PTR)g_base + RVA_GFRAME, &gf);
     if (g_meta) g_meta[META_DIAG_GF / 4] = gf;
 
-    /* ---------- v10.49 归因输入：52F900 的 this+0x34 vector[0] ---------- */
-    /* 触发：ai 仍为 0（既非 Missile owner、也非直取单位、反查链亦未归因）。
-     * 此时取游戏自己喂给判活门的那个 id：采集钩在 sub_52F900 入口
-     * （跳表 case 108）把 *(this+0x34) 的 vector[0] 写进邮箱，此处
-     * consume-once 取走并清零——宁可无输入，也不把旧 id 归到新事件。
-     * 取到 → 54BC00(注册表**对象地址**, &id) → 施法者单位 → ai/ag。
-     * 采集点为游戏门内同源输入（同一 handler 内既喂门又造伤害节点），
-     * 不再使用受击者 +0xEC 条目表（v10.46 押错的输入，已停用）。 */
-    if (ai && gid) {
-        mbx = 2;                        /* 取到却用不上：邮箱溢出（ex[15:12]）*/
-        diag_inc(META_DIAG_GDISC);
-    } else if (!ai) {
-        if (!gid) {
-            mbx = 0;                    /* 邮箱空：本事件无同源输入       */
-            diag_inc(META_DIAG_GEMPTY);
-        } else {
-            void *reg = entry_manager();
-            if (!g_fn_reverse || !reg) {
-                mbx = 5;                /* 原语未绑 / 单例未构造          */
-                diag_inc(META_DIAG_GNOREG);
-            } else {
-                DWORD anc;
-                diag_inc(META_DIAG_KREVTRY);
-                /* v10.56：调用前先落 ex 观测（入参 + ecx），返回后补返回值 */
-                gate = 1;                       /* 已发起调用             */
-                gin  = gid;                     /* 喂门的输入 id          */
-                greg = (DWORD)(UINT_PTR)reg;    /* ecx = 注册表对象地址    */
-                anc  = g_fn_reverse(reg, NULL, &gid);
-                gout = (DWORD)(UINT_PTR)anc;    /* 返回对象指针低 32 位    */
-                if (!anc) {
-                    gate = 2;           /* 调用并返 0：未过门             */
-                    mbx = 3;            /* 判活门未通过                   */
-                    diag_inc(META_DIAG_KREVA0);
-                } else {
-                    DWORD t2 = 0, c2 = 0, h2 = 0;
-                    void *o2 = NULL;
-                    gate = 3;           /* 调用并返非 0：过门             */
-                    t2 = type_of_obj(anc, &o2, &c2);
-                    grtt = t2;          /* 返回对象 RTTI 分类             */
-                    if (t2 >= 3 && t2 <= 6) {
-                        ai = c2;                  /* 施法者种类键        */
-                        if (get_handle((void *)(UINT_PTR)anc, &h2) && h2)
-                            ag = h2 >> 16;        /* 施法者真 gen        */
-                        src = 3;                  /* ex[11:8]：邮箱门    */
-                        mbx = 1;                  /* 取到并归因          */
-                        diag_inc(META_DIAG_KREVOK);
-                    } else {
-                        mbx = 4;                  /* 门返非玩家系        */
-                        diag_inc(META_DIAG_KREVNP);
-                    }
-                }
-            }
-        }
-    }
-
-    /* ex 调试对象：逐字段语义化（原因位 / 来源 / 邮箱相位 / 三个有效性位） */
-    ex.why   = ((DWORD)why | (zd ? 1u : 0u)) & 0x3Fu;   /* 位 1 = d==0      */
-    ex.src   = src & 0xFu;
-    ex.mbx   = mbx & 0xFu;
-    ex.gate  = gate;
-    ex.gin   = gin;
-    ex.gout  = gout;
-    ex.grtt  = grtt & 0xFu;
-    ex.greg  = greg;
-    ex.vg_ok = vg_real ? 1u : 0u;
-    ex.vi_ok = vi      ? 1u : 0u;
-    ex.ty_ok = ty_ok   ? 1u : 0u;
-    ex.nd_ok = has_node ? 1u : 0u;
-    ex.ver   = EX_VER;
-
+    /* v10.59：ex 调试字段整体清空（载荷内恒为 `{}`）。归因链保持 v10.57
+     * 口径：52F900 邮箱路线已移除，ai 只来自 Missile owner 或句柄直取；
+     * why / ty_ok 等仍照常进 META 诊断计数，只是不再逐事件落盘。 */
     if (why) diag_or(META_DIAG_WHY, why);
     if (ty_ok) diag_inc(META_DIAG_TYPAIR);   /* 现口径：ty 值有效条数 */
-    publish_event(gf, d, ty, &ex, ai, ag, vg, vi);
+    publish_event(gf, d, ty, ai, ag, vg, vi);
 }
 
 __declspec(naked) static void hook_settle(void)
@@ -1427,8 +1315,8 @@ __declspec(naked) static void hook_settle(void)
     }
 }
 
-/* 结算 hook 创建：同主 hook，只 Create 不 Enable。
- * hook2 是唯一发布点，Create 失败 = DPS 通道整场关闭（游戏无感知），
+/* 结算 hook 创建（v10.60 起唯一 hook）：只 Create 不 Enable。
+ * 它是唯一发布点，Create 失败 = DPS 通道整场关闭（游戏无感知），
  * 因此 DbgView 的 settle_hook= 是唯一现场判据。 */
 static BOOL create_hook_settle(void)
 {
@@ -1443,57 +1331,6 @@ static BOOL create_hook_settle(void)
         return FALSE;
     }
     return MH_CreateHook(tgt, (void *)hook_settle, &g_tram_t) == MH_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/* v10.49 输入采集：52F900 入口取 this+0x34 vector[0]                   */
-/*   采集侧只写邮箱；结算侧取走即清零（consume-once）——宁可无输入，     */
-/*   也不把旧 id 归到新事件上（错归属比缺失更糟）。                     */
-/* ------------------------------------------------------------------ */
-static void diag_inc(DWORD off);        /* 定义见诊断计数段            */
-
-static void capture_infl(DWORD obj)
-{
-    DWORD beg = 0, id = 0;
-
-    diag_inc(META_DIAG_GHIT);
-    if (!obj ||
-        !safe_read32((const BYTE *)(UINT_PTR)obj + 0x34, &beg) ||
-        beg < 0x10000 ||
-        !safe_read32((const BYTE *)(UINT_PTR)beg, &id) || !id) {
-        diag_inc(META_DIAG_GID0);       /* 空 vector / 首元素为 0      */
-        return;
-    }
-    InterlockedExchange(&g_infl_id, (LONG)id);
-}
-
-__declspec(naked) static void hook_infl(void)
-{
-    __asm {
-        pushad
-        mov     eax, [esp+36]           /* 唯一栈参 = 影响对象（stdcall）*/
-        push    eax
-        call    capture_infl
-        add     esp, 4
-        popad
-        jmp     [g_tram_infl]           /* 原 5 字节序言 + 回跳          */
-    }
-}
-
-/* 采集钩创建：失败不影响结算通道（只是 ai 少一条来源）。 */
-static BOOL create_hook_infl(void)
-{
-    BYTE *tgt = (BYTE *)(UINT_PTR)g_base + HOOK_INFL_RVA;
-
-    if (memcmp(tgt, EXPECT_PROLOGUE_INFL, HOOK_INFL_PATCH_LEN) != 0) {
-        char msg[128];
-        _snprintf(msg, sizeof msg - 1,
-            "[dps] prologue mismatch @ RVA 0x%X (infl hook), skipped",
-            HOOK_INFL_RVA);
-        OutputDebugStringA(msg);
-        return FALSE;
-    }
-    return MH_CreateHook(tgt, (void *)hook_infl, &g_tram_infl) == MH_OK;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1527,7 +1364,7 @@ static BOOL apply_queued_enable(void)
 static DWORD WINAPI init_thread_proc(LPVOID arg)
 {
     char tmp[32];
-    BOOL c_settle, c_infl, applied;      /* v10.49 结算钩 + 采集钩 */
+    BOOL c_settle, applied;              /* v10.57：仅剩结算钩 */
 
     if (GetEnvironmentVariableA("DPS_ON", tmp, sizeof tmp) &&
         lstrcmpA(tmp, "0") == 0)
@@ -1535,32 +1372,24 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
 
     g_base = (DWORD)(UINT_PTR)GetModuleHandleA(NULL);
 
-    /* v10.51 运行开关：DPS_REV 随 C/D 反查删除一并退役（已无路径可关）。
-     *  DPS_DBG → v10.44 曾用它门控结算路径 ODS 打印；v10.45 打印块已整体
-     *            移除（ODS 异常在分发中被游戏侧 fail-fast，实测致命），
-     *            该开关仅剩 init 单行摘要仍读取（init 线程非结算路径） */
-    if (GetEnvironmentVariableA("DPS_DBG", tmp, sizeof tmp) &&
-        lstrcmpA(tmp, "1") == 0)
-        g_dbg_print = 1;
-
+    /* v10.60：DPS_REV / DPS_DBG 均已退役 —— 前者无路径可关，后者曾门控
+     * 结算路径 ODS（v10.45 因游戏侧 fail-fast 整体移除），只剩"读入再
+     * 打印自己"的自证循环。DPS_ON=0 仍是唯一运行开关（见上）。 */
     /* VEH 探针护盾必须先于 hook 安装（探针 AV 永不进 SEH 链）。 */
     g_tls_probe = TlsAlloc();
-    g_veh = AddVectoredExceptionHandler(1, probe_veh);
+    AddVectoredExceptionHandler(1, probe_veh);   /* 返回值无需保存：常驻至进程退出 */
 
     shm_init();
 
     if (MH_Initialize() != MH_OK)
         goto diag;                       /* 引擎初始化失败：hook 不装 */
 
-    /* v10.38 结算钩 + v10.49 输入采集钩：各自 Create（含序言校验，零补丁
-     * 零生效）→ 单次 Queue+Apply（一次 Freeze 同时启用两者）。
-     * 启用最终态 = 结算 Create 结果 ∧ Apply 结果；采集钩失败只少一条 ai
-     * 来源，不关闭结算通道。 */
+    /* v10.57：只剩 v10.38 结算钩（唯一发布点）。Create 内含序言校验，
+     * 零补丁零生效；单次 Queue+Apply 只做一次 Freeze。
+     * 启用最终态 = 结算 Create 结果 ∧ Apply 结果。 */
     c_settle = create_hook_settle();
-    c_infl   = c_settle ? create_hook_infl() : FALSE;
     applied  = c_settle ? apply_queued_enable() : FALSE;
     g_hook_settle = (BOOL)(c_settle && applied);
-    g_hook_infl   = (BOOL)(c_infl && applied);
 
     /* 原语按序言校验后绑定：不符则保持 NULL（ty 省略 / d 取不到写 0 /
      * 攻击者身份解析失败），绝不把漂移过的地址当函数调。 */
@@ -1568,15 +1397,12 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
         const BYTE *hp = (const BYTE *)(UINT_PTR)g_base + RVA_GET_PROP;
         const BYTE *tp = (const BYTE *)(UINT_PTR)g_base + RVA_TY_REASM;
         const BYTE *np = (const BYTE *)(UINT_PTR)g_base + RVA_NODE_LOOKUP;
-        const BYTE *rp = (const BYTE *)(UINT_PTR)g_base + RVA_REVERSE;
         if (memcmp(hp, PROLOGUE_GET_PROP, sizeof PROLOGUE_GET_PROP) == 0)
             g_fn_get_prop = (fn_get_prop)hp;
         if (memcmp(tp, PROLOGUE_TY_REASM, sizeof PROLOGUE_TY_REASM) == 0)
             g_fn_ty_reasm = (fn_ty_reasm)tp;
         if (memcmp(np, PROLOGUE_NODE_LOOKUP, sizeof PROLOGUE_NODE_LOOKUP) == 0)
             g_fn_lookup = (fn_node_lookup)np;
-        if (memcmp(rp, PROLOGUE_REVERSE, sizeof PROLOGUE_REVERSE) == 0)
-            g_fn_reverse = (fn_reverse)rp;   /* v10.43 归属反查（54BC00） */
         /* g_mgr 不在 init 读：dword_4F82980 惰性创建，此时必为 0。
          * 每次结算时在 report_settle 内现读（v10.39）。 */
     }
@@ -1584,21 +1410,19 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     /* 诊断：安装状态写入 SHM flags + DbgView 单行摘要（排查"无数据"用） */
     if (g_meta) {
         DWORD flags = 4u;               /* bit2 SHM 就绪                  */
-        if (g_hook_settle) flags |= 2u;     /* bit1 结算钩（发布点）      */
-        if (g_hook_infl)   flags |= 8u;     /* bit3 输入采集钩            */
+        if (g_hook_settle) flags |= 2u;     /* bit1 结算钩（发布点）
+                                             * bit3 曾为输入采集钩，v10.57
+                                             * 移除后恒 0                    */
         g_meta[META_DIAG_FLAGS / 4] = flags;
     }
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.56 shm=%d settle_hook=%d(RVA 0x%X) "
-            "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
-            "rev=%d(dbg=%d) base=0x%X",
+            "[dps] init: rel=%s impl=v10.61 shm=%d settle_hook=%d(RVA 0x%X) "
+            "node_src=%d ty_src=%d d_src=%d base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
-            g_hook_infl, HOOK_INFL_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
             g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0,
-            g_fn_reverse ? 1 : 0, g_dbg_print,
             (unsigned)g_base);
         OutputDebugStringA(msg);
     }
