@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.1（PRD v1.7，实现版本 v10.43）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.2（PRD v1.7，实现版本 v10.44）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -100,6 +100,24 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.44（2026-11-27）：**崩溃修复 + 反查阶段落盘**（dump 实锤两发现）。
+ *   ① 崩溃根因（Aigis_r.exe.18696.dmp，0xC0000409 fail-fast）：结算路径内
+ *     OutputDebugStringA 的 DBG_PRINTEXCEPTION_C 走 SEH 分发，游戏 SEH 链
+ *     损坏环境不可用——崩溃瞬间栈上有在途 DBG 记录（param1 直指 rev 消息
+ *     缓冲 0x53efb8），fail-fast 经 unhandled→静默退出链触发。v10.43 的
+ *     rev 打印是本项目首次在结算路径用 ODS（v10.41 keydiag 从未实际打印
+ *     过：KPRT=0），故 v10.38–42 均不崩。⇒ rev/keydiag 打印改 DPS_DBG=1
+ *     才开，默认关。
+ *   ② 反查 0/284 根因（shm_20261127_103211）：ty=128（52F900 LABEL_41）
+ *     路径 284/284 次 ident+8 RTTI=Enemy@@（et==1）——该路径 node+0xC 的
+ *     ident+8 不是能力实例（疑似自节点/受击者句柄），54BC00 从未执行
+ *     （own=0/anc=0 恒成立）。§13.11 反查链语义仅适用于 5AA520 能力 DOT
+ *     路径候选；ty=128 归因须走受击者 +0xEC key 表（keydiag 线）。
+ *     55 个 ty=1/129 事件 ai/ag 正常（3 玩家 CardID 357/2735/495）。
+ *   新增：REV_AT1/ET1/ON0/NRG/A0/ANP 阶段计数 0x84/0x70/0x74/0x78/0x7C/
+ *     0x80（diag_ver 7→8）；DPS_REV=0 关闭反查路径（崩溃 A/B 分割）；
+ *     DPS_DBG=1 开打印。VERSION 1.4.1→1.4.2。
  *
  * v10.43（2026-11-27）：**能力实例归属反查上线**（SUB_5CBBE0_DECOMPILE
  *   §13.11 全链，实现候选 A）。why|=8 分支（攻击者非玩家系/未知——快照
@@ -359,6 +377,8 @@ static fn_get_prop    g_fn_get_prop = NULL;
 static fn_ty_reasm    g_fn_ty_reasm = NULL;
 static fn_node_lookup g_fn_lookup   = NULL;
 static fn_reverse     g_fn_reverse  = NULL;  /* v10.43 归属反查       */
+static int         g_rev_enable = 1;        /* DPS_REV=0 关闭反查路径    */
+static int         g_dbg_print  = 0;        /* DPS_DBG=1 才开结算路径打印 */
 static DWORD          g_mgr         = 0;     /* RVA_MGR 现读值（每次结算刷新，
                                                 * v10.38 曾 init 读一次 → 恒 0）*/
 static BOOL        g_hook_settle = FALSE;   /* hook2（唯一 hook/发布点）    */
@@ -838,6 +858,12 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_DIAG_REVTRY 0x64u   /* v10.43 归属反查尝试次数（why|=8 分支） */
 #define META_DIAG_REVOK  0x68u   /* 反查成功归因次数（ai/ag 已回填）       */
 #define META_DIAG_RPRT   0x6Cu   /* rev DbgView 已打印行数（预算 200）     */
+#define META_DIAG_REVET1 0x70u   /* v10.44 阶段：ident+8 判为敌类(et==1)   */
+#define META_DIAG_REVON0 0x74u   /* 阶段：et==0 但 [+0xC] 归属 id 为 0     */
+#define META_DIAG_REVNRG 0x78u   /* 阶段：own!=0 但 registry 单例不可用    */
+#define META_DIAG_REVA0  0x7Cu   /* 阶段：54BC00 判活反查返回 0            */
+#define META_DIAG_REVANP 0x80u   /* 阶段：锚点实体非玩家系 RTTI            */
+#define META_DIAG_REVAT1 0x84u   /* 阶段：resolve_cached(atk_h) 本身==1    */
 #define REVERSE_PRINT_BUDGET 200u
 #define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
@@ -872,7 +898,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 7;         /* v10.43：归属反查上线     */
+    g_meta[META_DIAG_VER / 4]  = 8;         /* v10.44：反查阶段计数     */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1174,7 +1200,7 @@ static void report_settle(const void *handle, DWORD vic_obj)
                 ag = atk_h >> 16;        /* 句柄直取，恒真 gen             */
                 ai = acard;
             } else {
-                /* ---- v10.43 能力实例归属反查（§13.11 全链，候选 A）----
+                /* ---- v10.43/44 能力实例归属反查（§13.11 全链，候选 A）----
                  * node+0xC = 攻击者引擎句柄（构造期快照，恒非 0）；
                  * 未归类为 Missile/玩家系 → 本体是能力实例或敌单位。
                  * 链：atk_h → ident(slot+4) → ident+8 = attacker 实体 →
@@ -1183,36 +1209,56 @@ static void report_settle(const void *handle, DWORD vic_obj)
                  *   RTTI 未知（能力实例）→ [实例+0xC] 归属 id
                  *   （5687C0 注册时写入）→ 54BC00(4F826E8,&id) 判活反查
                  *   → 锚点单位 → ai=[锚点+0x44]、ag=锚点句柄>>16。
-                 * 伤害正在结算 ⇒ 游戏自身 tick 门控（52F900 逐 tick
-                 * 54BC00(vector[0])）保证判活链必通过。敌单位（et==1）
-                 * 维持 ai=0 不反查（语义与旧行为一致）。 */
+                 * ⚠ v10.43 实跑裁决（shm_20261127_103211）：ty=128（52F900
+                 *   LABEL_41）路径 284/284 次 ident+8 判为 Enemy@@（et==1）
+                 *   —— 该路径 node+0xC 的 ident+8 不是能力实例（疑似自节点
+                 *   /受击者句柄），反查链只适用于 5AA520 能力 DOT 路径候选；
+                 *   ty=128 的归因须走受击者 +0xEC key 表（keydiag 线）。
+                 *   et==1 维持 ai=0（REV_ET1 计数），54BC00 不执行。
+                 * DPS_REV=0 可整体关闭本分支（崩溃 A/B 分割）。 */
                 DWORD rev_ok = 0, r_et = 0, r_anc = 0;
                 void *r_ident = NULL, *r_ent = NULL;
                 DWORD r_e8 = 0, r_own = 0;
 
+                {
+                    void *d_obj = NULL;          /* resolve_cached 出参不容
+                                                    NULL——哑变量接住（命中
+                                                    缓存，无额外开销）      */
+                    DWORD d_card = 0;
+                    if (resolve_cached(atk_h, &d_obj, &d_card) == 1)
+                        diag_inc(META_DIAG_REVAT1);   /* 攻击者句柄=敌类 */
+                }
                 diag_inc(META_DIAG_REVTRY);
-                r_ident = resolve_ident(atk_h);
-                if (r_ident &&
-                    safe_read32((const BYTE *)r_ident + 8, &r_e8) &&
-                    r_e8 >= 0x10000)
-                    r_ent = (void *)(UINT_PTR)r_e8;   /* 懒解析槽：目标实体 */
-                if (r_ent) {
-                    DWORD ecard = 0, eh = 0;
-                    void *eo = NULL;
-                    r_et = type_of_obj((DWORD)(UINT_PTR)r_ent, &eo, &ecard);
-                    if (r_et >= 3 && r_et <= 6) {
-                        ai = ecard;                   /* 单位本体直取       */
-                        if (get_handle(r_ent, &eh) && eh) ag = eh >> 16;
-                        rev_ok = 1;
-                    } else if (r_et == 0) {           /* 能力实例候选       */
-                        DWORD reg = 0;
-                        if (safe_read32((const BYTE *)r_ent + 0xC, &r_own)
-                            && r_own && g_fn_reverse &&
-                            safe_read32((const BYTE *)(UINT_PTR)g_base
-                                        + RVA_REGMGR, &reg) && reg) {
-                            r_anc = g_fn_reverse((void *)(UINT_PTR)reg,
-                                                 NULL, &r_own);
-                            if (r_anc) {
+                if (g_rev_enable) {
+                    r_ident = resolve_ident(atk_h);
+                    if (r_ident &&
+                        safe_read32((const BYTE *)r_ident + 8, &r_e8) &&
+                        r_e8 >= 0x10000)
+                        r_ent = (void *)(UINT_PTR)r_e8;   /* 懒解析槽     */
+                    if (r_ent) {
+                        DWORD ecard = 0, eh = 0;
+                        void *eo = NULL;
+                        r_et = type_of_obj((DWORD)(UINT_PTR)r_ent, &eo,
+                                           &ecard);
+                        if (r_et >= 3 && r_et <= 6) {
+                            ai = ecard;               /* 单位本体直取   */
+                            if (get_handle(r_ent, &eh) && eh) ag = eh >> 16;
+                            rev_ok = 1;
+                        } else if (r_et == 0) {       /* 能力实例候选   */
+                            DWORD reg = 0;
+                            if (!safe_read32((const BYTE *)r_ent + 0xC,
+                                             &r_own) || !r_own) {
+                                diag_inc(META_DIAG_REVON0);
+                            } else if (!g_fn_reverse ||
+                                       !safe_read32(
+                                           (const BYTE *)(UINT_PTR)g_base
+                                           + RVA_REGMGR, &reg) || !reg) {
+                                diag_inc(META_DIAG_REVNRG);
+                            } else if (!(r_anc = g_fn_reverse(
+                                             (void *)(UINT_PTR)reg,
+                                             NULL, &r_own))) {
+                                diag_inc(META_DIAG_REVA0);
+                            } else {
                                 DWORD ac2 = 0, ah = 0, at2;
                                 void *ao2 = NULL;
                                 at2 = type_of_obj(r_anc, &ao2, &ac2);
@@ -1222,11 +1268,15 @@ static void report_settle(const void *handle, DWORD vic_obj)
                                                    &ah) && ah)
                                         ag = ah >> 16;
                                     rev_ok = 1;
+                                } else {
+                                    diag_inc(META_DIAG_REVANP);
                                 }
                             }
+                        } else if (r_et == 1) {
+                            diag_inc(META_DIAG_REVET1);
                         }
+                        /* 其余 et：维持 ai=0，why|=8 旧行为 */
                     }
-                    /* r_et==1（敌单位）等：维持 ai=0，why|=8 旧行为 */
                 }
                 if (rev_ok) {
                     diag_inc(META_DIAG_REVOK);
@@ -1236,8 +1286,11 @@ static void report_settle(const void *handle, DWORD vic_obj)
                         why |= 64;        /* 反查已执行但 ident+8 链上
                                              未归因（细分观测）            */
                 }
-                /* DbgView rev 样本行：预算 200 行，核对反查链各环节 */
-                if (g_meta
+                /* DbgView rev 样本行：预算 200 行。
+                 * ⚠ v10.44 起默认关闭（DPS_DBG=1 才开）：结算路径内 ODS 的
+                 * DBG_PRINTEXCEPTION_C 走 SEH 分发，游戏 SEH 链损坏环境下
+                 * 实测触发 fail-fast 0xC0000409（dump 实锤在途记录）。 */
+                if (g_dbg_print && g_meta
                     && g_meta[META_DIAG_RPRT / 4] < REVERSE_PRINT_BUDGET) {
                     char msg[224];
                     diag_inc(META_DIAG_RPRT);
@@ -1300,8 +1353,9 @@ static void report_settle(const void *handle, DWORD vic_obj)
             else if (kd.nkeys > 1) diag_inc(META_DIAG_KMULTI);
             kd_t = resolve_cached(kd.keys[0], &kd_obj, &kd_card);
             if (kd_t >= 3 && kd_t <= 6) diag_inc(META_DIAG_KRES);
-            /* DbgView 样本行：预算 200 行（防刷屏），读 meta 计数 */
-            if (g_meta
+            /* DbgView 样本行：预算 200 行（防刷屏），读 meta 计数。
+             * v10.44 起默认关闭（DPS_DBG=1 才开）——同 rev 行理由。 */
+            if (g_dbg_print && g_meta
                 && g_meta[META_DIAG_KPRT / 4] < KEYDIAG_PRINT_BUDGET) {
                 char msg[224];
                 diag_inc(META_DIAG_KPRT);
@@ -1401,6 +1455,17 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
 
     g_base = (DWORD)(UINT_PTR)GetModuleHandleA(NULL);
 
+    /* v10.44 运行开关：
+     *  DPS_REV=0 → 关闭归属反查（崩溃 A/B 分割用；why|=8 行为回到 v10.42）
+     *  DPS_DBG=1 → 才允许结算路径内 OutputDebugStringA 打印（v10.43 实测
+     *              在游戏的损坏 SEH 链上引发 fail-fast 0xC0000409，默认关）*/
+    if (GetEnvironmentVariableA("DPS_REV", tmp, sizeof tmp) &&
+        lstrcmpA(tmp, "0") == 0)
+        g_rev_enable = 0;
+    if (GetEnvironmentVariableA("DPS_DBG", tmp, sizeof tmp) &&
+        lstrcmpA(tmp, "1") == 0)
+        g_dbg_print = 1;
+
     /* VEH 探针护盾必须先于 hook 安装（探针 AV 永不进 SEH 链）。 */
     g_tls_probe = TlsAlloc();
     g_veh = AddVectoredExceptionHandler(1, probe_veh);
@@ -1444,12 +1509,13 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[192];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.43 shm=%d settle_hook=%d(RVA 0x%X) "
-            "node_src=%d ty_src=%d d_src=%d rev=%d base=0x%X",
+            "[dps] init: rel=%s impl=v10.44 shm=%d settle_hook=%d(RVA 0x%X) "
+            "node_src=%d ty_src=%d d_src=%d rev=%d(rev_en=%d dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
             g_fn_lookup ? 1 : 0,      /* mgr 现读，node_src 仅表原语绑定 */
             g_fn_ty_reasm ? 1 : 0, g_fn_get_prop ? 1 : 0,
-            g_fn_reverse ? 1 : 0, (unsigned)g_base);
+            g_fn_reverse ? 1 : 0, g_rev_enable, g_dbg_print,
+            (unsigned)g_base);
         OutputDebugStringA(msg);
     }
 diag:
