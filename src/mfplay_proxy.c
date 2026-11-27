@@ -1,6 +1,6 @@
 /* ==========================================================================
  * aigis-dps / mfplay_proxy.c —— 发布批次 1.2.0（线上版·未发新批次；PRD v1.7，
- * 实现版本 v10.55）
+ * 实现版本 v10.56）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -36,10 +36,12 @@
  *
  * 输出载荷（JSONL，业务字段 + ex 对象全必现；顺序契约见 v10.29，v10.54 定序）：
  *   {"gf":20013,"ai":1469,"ag":3584,"vi":4761,"vg":4106,"d":7025,"ty":1,
- *    "ex":{"why":8,"src":0,"mbx":3,"vg_ok":1,"vi_ok":1,"ty_ok":1,
- *          "nd_ok":1,"ver":2}}
+ *    "ex":{"why":8,"src":0,"mbx":1,"gate":3,"gin":286331153,"gout":4194304,
+ *          "grtt":3,"greg":129876456,"vg_ok":1,"vi_ok":1,"ty_ok":1,
+ *          "nd_ok":1,"ver":3}}
  *   ty 自 v10.54 起取消可选（原语不可用时以 0 占位，位置不变）；
- *   ex 恒为末位字段且内部为具名字段对象（v10.55，载荷内唯一调试通道）。
+ *   ex 恒为末位字段且内部为具名字段对象（v10.55 具名化，v10.56 追加判活门
+ *   调用/返回；载荷内唯一调试通道）。
  *     gf = GameFrame（dword_F51838，暂停/倍速感知时钟）
  *     ai = 攻击者 CardID（导弹事件 = owner 的 CardID，[对象+44h]）
  *     ag = 攻击者实例标识 = 句柄高 16 位 gen（导弹事件 = owner 的 gen）
@@ -129,6 +131,18 @@
  *   v10.43–v10.49 期间把 VERSION 从 1.4.1 连推到 1.4.6 属误用，已废止；下文
  *   历史条目里的「VERSION x→y」只作 impl 变更注记，不再是发布记录。
  *   本次行为零变化（仅版本注入与注释），diag_ver 保持 11。
+ *
+ * v10.56（2026-11-27）：**判活门（54BC00）的调用与返回纳入 ex**（用户令）。
+ *   ex 追加 5 个字段，schema 版本 2→3：
+ *     gate 调用状态（0 未调用 / 1 已发起 / 2 返 0 / 3 返非 0）
+ *     gin  喂门的输入 id（邮箱取到的 cand）
+ *     gout 返回对象指针（低 32 位；0 = 返 0）
+ *     grtt 返回对象的 RTTI 分类（type_of_obj；0 需配合 gate 判读）
+ *     greg 调用时 ecx 传入的注册表对象地址（应恒 = base + RVA_REGMGR，
+ *          用于现场核验「传地址而非 vptr」这条 v10.48 修正）
+ *   payload 容量 224→320，异常上界 208→288（满值约 261B，典型 ~190B）。
+ *   gate/gin/gout/grtt/greg 与 mbx 正交：mbx 说「归因走到哪」，gate 组说
+ *   「门本身怎么被调、返回了什么」。diag_ver 16→17，rel 仍 1.2.0。
  *
  * v10.55（2026-11-27）：**ex 内部改为具名字段对象**（用户令：ex 值内部也用
  *   字段做语义格式化）。原单 u32 位域 → JSON 对象，字段恒全必现：
@@ -1015,7 +1029,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 16;        /* v10.55：ex 改具名字段    */
+    g_meta[META_DIAG_VER / 4]  = 17;        /* v10.56：ex 加判活门观测  */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -1103,26 +1117,39 @@ static void diag_or(DWORD off, LONG bits)
 /* ---------- ex 调试对象（v10.55，载荷内唯一调试通道） ---------- */
 /* 约定：**以后所有调试信息都从 ex 出**，不再新增载荷字段，也不再新增
  * META 计数（计数只作进程内累计，事件级归因一律走 ex）。
- * v10.55 起 ex 由「单个 u32 位域」改为**具名字段对象**（用户令：ex 内部也用
- * 字段做语义格式化）。线路形态恒为：
- *   "ex":{"why":8,"src":0,"mbx":3,"vg_ok":1,"vi_ok":1,"ty_ok":1,"nd_ok":1,"ver":2}
- * 字段全部必现（整数，无嵌套可选），语义与 v10.53 位布局一一对应：
+ * v10.55 起 ex 改为**具名字段对象**（用户令：ex 内部也用字段做语义格式化）；
+ * v10.56 追加判活门（54BC00）的调用入参与返回（用户令：判活函数的调用和
+ * 返回也放进调试信息）。线路形态恒为：
+ *   "ex":{"why":8,"src":0,"mbx":1,"gate":3,"gin":286331153,"gout":4194304,
+ *         "grtt":3,"greg":129876456,"vg_ok":1,"vi_ok":1,"ty_ok":1,"nd_ok":1,
+ *         "ver":3}
+ * 字段全部必现（整数，无嵌套可选）：
  *   why    原因位（位集合，非枚举）：1 d==0 / 2 参数空 / 4 受击非敌 /
  *          8 攻击未归因 / 16 攻击者未知 / 32 owner 非玩家系
  *   src    ai 来源：0 无 / 1 Missile owner / 2 句柄直取 / 3 邮箱门（52F900）
  *   mbx    邮箱相位：0 未取到 / 1 取到并归因 / 2 取到但 ai 已有（丢弃）/
  *          3 门返 0 / 4 门返非玩家系 / 5 原语或单例未就绪
+ *   gate   判活门调用状态（v10.56）：0 未调用 / 1 已调用（返回前异常态，
+ *          正常不会出现）/ 2 调用并返回 0（未过门）/ 3 调用并返非 0（过门）
+ *   gin    喂给门的输入 id（= 邮箱取到的 cand；十进制，阅读时按 hex 看）
+ *   gout   门返回值（施法者对象指针低 32 位；0 = 返回 0）
+ *   grtt   门返回对象的 RTTI 分类（type_of_obj：0..6；0 需配合 gate 区分
+ *          「未调用/返 0」与「真实分类 0」）
+ *   greg   调用时 ecx 传入的注册表对象地址（应恒 = base + RVA_REGMGR；
+ *          用于现场核验传参契约，与服务端静态实锤对照）
  *   vg_ok  vg 为真 gen（受击者句柄可用，非指针低位退化）
  *   vi_ok  vi 有效（模式槽索引非 0）
  *   ty_ok  ty 值有效（字段恒存在；0 = 以 0 占位的无效值）
  *   nd_ok  伤害节点（node）已查到
- *   ver    ex schema 版本（当前 2）；解析端先比 ver，再解释其余字段
+ *   ver    ex schema 版本（当前 3）；解析端先比 ver，再解释其余字段
  * 新增调试维度 = 加字段 + ver 递增（**不改已有字段名/含义**）；ex 恒为载荷
  * 最末字段，扩张只影响尾部，业务前缀不受影响。 */
-#define EX_VER 2u
+#define EX_VER 3u
 
 typedef struct {
-    DWORD why, src, mbx, vg_ok, vi_ok, ty_ok, nd_ok, ver;
+    DWORD why, src, mbx;                /* 归因结论与邮箱相位            */
+    DWORD gate, gin, gout, grtt, greg;  /* v10.56 判活门调用/返回        */
+    DWORD vg_ok, vi_ok, ty_ok, nd_ok, ver;
 } ex_fields;
 
 /* 载荷组装（v10.29 单一模板；v10.54：八字段全必现，ex 恒末位）。
@@ -1138,7 +1165,7 @@ typedef struct {
 static void publish_event(DWORD gf, DWORD d, DWORD ty, const ex_fields *ex,
                           DWORD ai, DWORD ag, DWORD vg, DWORD vi)
 {
-    char  payload[224];
+    char  payload[320];
     char *w    = payload;
     int   left = (int)sizeof payload;
     int   n;
@@ -1149,21 +1176,25 @@ static void publish_event(DWORD gf, DWORD d, DWORD ty, const ex_fields *ex,
                   "{\"gf\":%lu,\"ai\":%lu,\"ag\":%lu,\"vi\":%lu,"
                   "\"vg\":%lu,\"d\":%lu,\"ty\":%lu,"
                   "\"ex\":{\"why\":%lu,\"src\":%lu,\"mbx\":%lu,"
-                  "\"vg_ok\":%lu,\"vi_ok\":%lu,\"ty_ok\":%lu,"
-                  "\"nd_ok\":%lu,\"ver\":%lu}}",
+                  "\"gate\":%lu,\"gin\":%lu,\"gout\":%lu,\"grtt\":%lu,"
+                  "\"greg\":%lu,\"vg_ok\":%lu,\"vi_ok\":%lu,"
+                  "\"ty_ok\":%lu,\"nd_ok\":%lu,\"ver\":%lu}}",
                   (unsigned long)gf, (unsigned long)ai, (unsigned long)ag,
                   (unsigned long)vi, (unsigned long)vg, (unsigned long)d,
                   (unsigned long)ty,
                   (unsigned long)ex->why, (unsigned long)ex->src,
-                  (unsigned long)ex->mbx, (unsigned long)ex->vg_ok,
-                  (unsigned long)ex->vi_ok, (unsigned long)ex->ty_ok,
-                  (unsigned long)ex->nd_ok, (unsigned long)ex->ver);
+                  (unsigned long)ex->mbx, (unsigned long)ex->gate,
+                  (unsigned long)ex->gin, (unsigned long)ex->gout,
+                  (unsigned long)ex->grtt, (unsigned long)ex->greg,
+                  (unsigned long)ex->vg_ok, (unsigned long)ex->vi_ok,
+                  (unsigned long)ex->ty_ok, (unsigned long)ex->nd_ok,
+                  (unsigned long)ex->ver);
     if (n <= 0 || n >= left) return;     /* 截断/负值：不发布半截数据 */
     w += n;
 
-    /* 上界 = 7 业务字段 + ex 全取 u32 满值（~190B）；超 208B 只可能是格式化
+    /* 上界 = 7 业务字段 + ex 全取 u32 满值（~261B）；超 288B 只可能是格式化
      * 异常（新增 ex 字段后须同步抬高此界与 payload 容量）。 */
-    if ((DWORD)(w - payload) > 208u) return;
+    if ((DWORD)(w - payload) > 288u) return;
     shm_publish(payload, (DWORD)(w - payload));
     diag_inc(META_DIAG_PUB);
 }
@@ -1183,6 +1214,8 @@ static void report_settle(const void *handle, DWORD vic_obj)
     LONG  why = 0;
     /* ex 调试对象素材（v10.55 起具名字段，见 ex_fields 定义） */
     DWORD src = 0, mbx = 0, has_node = 0, zd = 0, vg_real = 0;
+    /* v10.56 判活门观测：调用状态 / 入参 id / 返回值 / 返回对象分类 / ecx */
+    DWORD gate = 0, gin = 0, gout = 0, grtt = 0, greg = 0;
     ex_fields ex;
 
     diag_inc(META_DIAG_TYHIT);           /* 诊断：hook2 命中（= 发布条数） */
@@ -1327,14 +1360,22 @@ static void report_settle(const void *handle, DWORD vic_obj)
             } else {
                 DWORD anc;
                 diag_inc(META_DIAG_KREVTRY);
-                anc = g_fn_reverse(reg, NULL, &gid);
+                /* v10.56：调用前先落 ex 观测（入参 + ecx），返回后补返回值 */
+                gate = 1;                       /* 已发起调用             */
+                gin  = gid;                     /* 喂门的输入 id          */
+                greg = (DWORD)(UINT_PTR)reg;    /* ecx = 注册表对象地址    */
+                anc  = g_fn_reverse(reg, NULL, &gid);
+                gout = (DWORD)(UINT_PTR)anc;    /* 返回对象指针低 32 位    */
                 if (!anc) {
+                    gate = 2;           /* 调用并返 0：未过门             */
                     mbx = 3;            /* 判活门未通过                   */
                     diag_inc(META_DIAG_KREVA0);
                 } else {
                     DWORD t2 = 0, c2 = 0, h2 = 0;
                     void *o2 = NULL;
+                    gate = 3;           /* 调用并返非 0：过门             */
                     t2 = type_of_obj(anc, &o2, &c2);
+                    grtt = t2;          /* 返回对象 RTTI 分类             */
                     if (t2 >= 3 && t2 <= 6) {
                         ai = c2;                  /* 施法者种类键        */
                         if (get_handle((void *)(UINT_PTR)anc, &h2) && h2)
@@ -1355,6 +1396,11 @@ static void report_settle(const void *handle, DWORD vic_obj)
     ex.why   = ((DWORD)why | (zd ? 1u : 0u)) & 0x3Fu;   /* 位 1 = d==0      */
     ex.src   = src & 0xFu;
     ex.mbx   = mbx & 0xFu;
+    ex.gate  = gate;
+    ex.gin   = gin;
+    ex.gout  = gout;
+    ex.grtt  = grtt & 0xFu;
+    ex.greg  = greg;
     ex.vg_ok = vg_real ? 1u : 0u;
     ex.vi_ok = vi      ? 1u : 0u;
     ex.ty_ok = ty_ok   ? 1u : 0u;
@@ -1545,7 +1591,7 @@ static DWORD WINAPI init_thread_proc(LPVOID arg)
     {
         char msg[256];
         _snprintf(msg, sizeof msg - 1,
-            "[dps] init: rel=%s impl=v10.55 shm=%d settle_hook=%d(RVA 0x%X) "
+            "[dps] init: rel=%s impl=v10.56 shm=%d settle_hook=%d(RVA 0x%X) "
             "infl_hook=%d(RVA 0x%X) node_src=%d ty_src=%d d_src=%d "
             "rev=%d(dbg=%d) base=0x%X",
             DPS_REL_VER, g_shm ? 1 : 0, g_hook_settle, HOOK_SETTLE_RVA,
