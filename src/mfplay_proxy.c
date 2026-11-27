@@ -1,5 +1,5 @@
 /* ==========================================================================
- * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.2（PRD v1.7，实现版本 v10.44）
+ * aigis-dps / mfplay_proxy.c —— 发布批次 1.4.4（PRD v1.7，实现版本 v10.46）
  *
  * 业务：dps 统计。单 hook（v10.38 定稿）：
  *   hook  sub_5CAC50（敌方侧结算的受击子步骤，每次结算正好一次）
@@ -100,6 +100,15 @@
  *   可选字段恒在末位使所有事件共享稳定前缀（字节级 diff / 前缀比对友好）。
  *   JSON 对象无序语义 + 消费端均为标准解析器（Go json.Unmarshal /
  *   Python json.loads），顺序变更对 reader 零影响。
+ *
+ * v10.46（2026-11-27）：**判活门本体反查回填**（用户令：不做其他工作，
+ *   只顺着游戏内判活门本体路径获取 ai/ag）。keydiag 由纯观测升级为归因：
+ *   受击者 +0xEC 条目表条目的归属 id（内层 map key，静态实锤同源于
+ *   52F900 LABEL_41 逐 tick 的 54BC00(vector[0]) 输入）→
+ *   54BC00(4F826E8,&id) 判活反查（伤害结算中 ⇒ 门必通过）→ 施法者单位
+ *   → ai=[obj+0x44]、ag=get_handle>>16，publish 前回填。键与 +0x4C
+ *   去重各试一次，ai 命中即止。新增 KREVTRY/OK/A0/NP 0x88–0x94
+ *   （diag_ver 8→9）。VERSION 1.4.3→1.4.4。
  *
  * v10.45（2026-11-27）：**结算路径 ODS 禁令升级为整体移除**（v10.44 门控
  *   不彻底）。崩溃场次（用户观察：第一次 DOT 伤害出现瞬间）实证：
@@ -873,6 +882,10 @@ static DWORD inst_id(DWORD handle, DWORD obj)
 #define META_DIAG_REVA0  0x7Cu   /* 阶段：54BC00 判活反查返回 0            */
 #define META_DIAG_REVANP 0x80u   /* 阶段：锚点实体非玩家系 RTTI            */
 #define META_DIAG_REVAT1 0x84u   /* 阶段：resolve_cached(atk_h) 本身==1    */
+#define META_DIAG_KREVTRY 0x88u  /* v10.46：条目归属 id → 54BC00 尝试次数  */
+#define META_DIAG_KREVOK  0x8Cu  /* v10.46：判活门反查成功回填 ai/ag 次数  */
+#define META_DIAG_KREVA0  0x90u  /* v10.46：54BC00 返回 0（判活门未通过）  */
+#define META_DIAG_KREVNP  0x94u  /* v10.46：锚点单位非玩家系 RTTI          */
 #define REVERSE_PRINT_BUDGET 200u
 #define KEYDIAG_PRINT_BUDGET 200u
 static HANDLE         g_shm_map  = NULL;
@@ -907,7 +920,7 @@ static void shm_init(void)
     g_meta[META_HDR_VER / 4]   = SHM_HDR_VER;
     g_meta[META_SEQ_TOTAL / 4] = 0;
     g_meta[META_OLDEST / 4]    = 0;
-    g_meta[META_DIAG_VER / 4]  = 8;         /* v10.44：反查阶段计数     */
+    g_meta[META_DIAG_VER / 4]  = 9;         /* v10.46：判活门反查回填   */
     g_meta[META_DIAG_FLAGS / 4]= 4;         /* bit2：SHM 就绪            */
     g_meta[META_DIAG_TYHIT / 4]= 0;
     g_meta[META_DIAG_TYPAIR/4] = 0;
@@ -923,6 +936,10 @@ static void shm_init(void)
     g_meta[META_DIAG_KPRT / 4] = 0;
     g_meta[META_DIAG_KEV / 4]  = 0;
     g_meta[META_DIAG_KMULTI/4] = 0;
+    g_meta[META_DIAG_KREVTRY/4]= 0;
+    g_meta[META_DIAG_KREVOK/4] = 0;
+    g_meta[META_DIAG_KREVA0/4] = 0;
+    g_meta[META_DIAG_KREVNP/4] = 0;
 }
 
 /* 单条发布：payload 为一行 JSON（不含 '\0'）。无分配、无文件 IO、
@@ -1355,6 +1372,51 @@ static void report_settle(const void *handle, DWORD vic_obj)
             /* v10.45：keydiag DbgView 打印整体移除——结算路径内 ODS 禁令
              * 同 rev 行（dump 链实锤见上方注释）。样本数据 kd.* 结构已在
              * 内存中，如需明细后续经 SHM 扩展槽离线导出，不再走 ODS。 */
+
+            /* ---- v10.46 判活门本体反查（唯一归因路径，用户令）----
+             * 游戏 DOT tick（52F900 LABEL_41）逐 tick 调 54BC00(条目内
+             * 施法者归属 id) 判活施法者——反查时伤害正在结算，该门必
+             * 通过（§13.9 用户断言机制本体）。hook 侧同源输入：受击者
+             * +0xEC 条目表条目的归属 id（内层 map key @条目+0x4C，
+             * v10.41 静态实锤）→ 54BC00(4F826E8,&id) → 施法者单位 →
+             * ai=[obj+0x44]、ag=get_handle>>16。键与 +0x4C 去重后各试
+             * 一次；键不唯一（nkeys>1）只取首个采样。 */
+            if (!g_fn_reverse) {
+                /* 原语未绑定：静默（why 已带 8）                          */
+            } else {
+                DWORD reg = 0;
+                if (safe_read32((const BYTE *)(UINT_PTR)g_base
+                                + RVA_REGMGR, &reg) && reg) {
+                    DWORD cand[2] = {0, 0};
+                    int   ncand = 0, ci;
+                    if (kd.keys[0]) cand[ncand++] = kd.keys[0];
+                    if (kd.last_4c && kd.last_4c != kd.keys[0])
+                        cand[ncand++] = kd.last_4c;
+                    for (ci = 0; ci < ncand && !ai; ci++) {
+                        DWORD anc = g_fn_reverse((void *)(UINT_PTR)reg, NULL,
+                                                 &cand[ci]);
+                        diag_inc(META_DIAG_KREVTRY);
+                        if (!anc) {
+                            diag_inc(META_DIAG_KREVA0);  /* 判活门未通过 */
+                            continue;
+                        }
+                        {
+                            DWORD t2 = 0, c2 = 0, h2 = 0;
+                            void *o2 = NULL;
+                            t2 = type_of_obj(anc, &o2, &c2);
+                            if (t2 >= 3 && t2 <= 6) {
+                                ai = c2;                 /* 施法者种类键 */
+                                if (get_handle((void *)(UINT_PTR)anc, &h2)
+                                    && h2)
+                                    ag = h2 >> 16;       /* 施法者真 gen */
+                                diag_inc(META_DIAG_KREVOK);
+                            } else {
+                                diag_inc(META_DIAG_KREVNP);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
